@@ -68,6 +68,7 @@ export default function CreateQuizPage() {
   const [questions, setQuestions] = useState<Question[]>([])
   const [keywords, setKeywords] = useState("")
   const [isGenerating, setIsGenerating] = useState(false)
+  const [numQuestions, setNumQuestions] = useState(5)
 
   // AI Question Generation
   const generateQuestionsWithAI = async () => {
@@ -81,7 +82,7 @@ export default function CreateQuizPage() {
       const res = await fetch("/api/quiz/generate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ keywords, numQuestions: 5 })
+        body: JSON.stringify({ keywords, numQuestions })
       })
       const data = await res.json()
       if (!res.ok) throw new Error(data.error || "Failed to generate questions.")
@@ -471,6 +472,18 @@ export default function CreateQuizPage() {
                     disabled={isSaving || isGenerating}
                   />
                 </div>
+                <div className="flex flex-col gap-2 min-w-[120px]">
+                  <Label htmlFor="numQuestions">Number of Questions</Label>
+                  <Input
+                    id="numQuestions"
+                    type="number"
+                    min={1}
+                    max={50}
+                    value={numQuestions}
+                    onChange={e => setNumQuestions(Number(e.target.value))}
+                    disabled={isSaving || isGenerating}
+                  />
+                </div>
                 <Button
                   onClick={generateQuestionsWithAI}
                   disabled={isSaving || isGenerating || !keywords.trim()}
@@ -587,7 +600,7 @@ interface QuestionEditorProps {
 
 
 function QuestionEditor({ question, index, onUpdate, onRemove, onUpdateOption, disabled }: QuestionEditorProps) {
-  // ...existing code...
+  // Question editor logic
 
   return (
     <Card className="border-l-4 border-l-purple-500">
@@ -702,7 +715,7 @@ function QuestionEditor({ question, index, onUpdate, onRemove, onUpdateOption, d
             </div>
           </div>
         )}
-        // ...existing code...
+        
        
 
         {question.type === "short-answer" && (
