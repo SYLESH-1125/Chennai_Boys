@@ -1,3 +1,5 @@
+import { supabase } from './supabase';
+
 export interface User {
   id: string
   name: string
@@ -151,3 +153,49 @@ export const saveUser = (user: User) => {
 }
 
 export default userManager
+
+export async function updateStudentQuizHistory(studentId: string) {
+  // Fetch all quiz results for the student
+  const { data: results, error: resultsError } = await supabase
+    .from('quiz_results')
+    .select('quiz_id, score, correct_answers, total_questions, time_spent, taken_at')
+    .eq('student_id', studentId)
+    .order('taken_at', { ascending: false });
+  if (resultsError) {
+    console.error('Error fetching quiz results:', resultsError);
+    return;
+  }
+  // Fetch all quiz titles for the quiz_ids
+  const quizIds = [...new Set(results.map((r: any) => r.quiz_id))];
+  const { data: quizzes, error: quizzesError } = await supabase
+    .from('quizzes')
+    .select('id, title')
+    .in('id', quizIds);
+  if (quizzesError) {
+    console.error('Error fetching quizzes:', quizzesError);
+    return;
+  }
+  // Map quiz_id to title
+  const quizIdToTitle: Record<string, string> = {};
+  quizzes.forEach((q: any) => {
+    quizIdToTitle[q.id] = q.title;
+  });
+  // Build quiz_history array with titles
+  const quizHistory = results.map((r: any) => ({
+    quiz_id: r.quiz_id,
+    title: quizIdToTitle[r.quiz_id] || r.quiz_id,
+    score: r.score,
+    correct_answers: r.correct_answers,
+    total_questions: r.total_questions,
+    time_spent: r.time_spent,
+    taken_at: r.taken_at,
+  }));
+  // Update the student's quiz_history field
+  const { error: updateError } = await supabase
+    .from('students')
+    .update({ quiz_history: quizHistory })
+    .eq('id', studentId);
+  if (updateError) {
+    console.error('Error updating student quiz_history:', updateError);
+  }
+}

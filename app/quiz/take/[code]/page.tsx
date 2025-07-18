@@ -13,6 +13,7 @@ import { Clock, CheckCircle, AlertCircle, BookOpen } from "lucide-react"
 import { useRouter, useParams } from "next/navigation"
 import { supabase } from "@/lib/supabase";
 import { useAuth } from "@/contexts/auth-context";
+import { updateStudentQuizHistory } from '@/lib/user-management';
 
 interface Question {
   id: string;
@@ -103,9 +104,9 @@ export default function TakeQuizPage() {
       let correctAnswers = 0;
       let totalPoints = 0;
       let earnedPoints = 0;
-      quiz.questions.forEach((question: Question) => {
+      quiz.questions.forEach((question) => {
         totalPoints += question.points;
-        const userAnswer = answers[question.id as string];
+        const userAnswer = answers[question.id];
         let isCorrect = false;
         if (question.type === "multiple-choice" || question.type === "true-false") {
           isCorrect = String(userAnswer).toLowerCase() === String(question.correctAnswer).toLowerCase();
@@ -119,18 +120,29 @@ export default function TakeQuizPage() {
       });
       const score = earnedPoints;
       const timeSpent = quiz.timelimit - timeLeft;
-      // Save result to Supabase
+
+      // Save result to Supabase with all columns
       const result = {
         student_id: user.id,
-        quiz_code: quiz.code,
-        correctanswers: correctAnswers,
-        totalquestions: quiz.questions.length,
+        quiz_id: quiz.id,
         score,
-        timespent: timeSpent,
-        submittedat: new Date().toISOString(),
-        answers,
+        attempts: 1,
+        status: "completed",
+        taken_at: new Date().toISOString(),
+        answers, // student's answers (object)
+        correct_answers: correctAnswers,
+        total_questions: quiz.questions.length,
+        time_spent: timeSpent,
+        submitted_at: new Date().toISOString(),
       };
-      await supabase.from("quiz_results").insert([result]);
+      const { error: insertError } = await supabase.from("quiz_results").insert([result]);
+      if (insertError) {
+        setError("Failed to submit quiz: " + insertError.message);
+        setIsSubmitting(false);
+        return;
+      }
+      // Update student's quiz_history with titles
+      await updateStudentQuizHistory(user.id);
       setResultData({ correctAnswers, totalQuestions: quiz.questions.length, score });
       setShowResult(true);
     } catch (error) {

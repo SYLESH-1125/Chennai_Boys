@@ -37,6 +37,7 @@ import {
 import { Line } from "react-chartjs-2"
 import { useAuth } from "@/contexts/auth-context"
 import { supabase } from "@/lib/supabase";
+import jsPDF from 'jspdf';
 
 ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend)
 
@@ -74,17 +75,42 @@ const getInitials = (displayName: string) =>
     .join("")
     .toUpperCase()
 
+function useStudentProfile(userId: any) {
+  const [student, setStudent] = useState<any>(null);
+
+  useEffect(() => {
+    if (!userId) return;
+    const fetchStudent = async () => {
+      const { data, error } = await supabase
+        .from('students')
+        .select('avg_score, avg_accuracy, avg_time_spent, best_score, lowest_score, quizzes_taken, quiz_history')
+        .eq('id', userId)
+        .single();
+      setStudent(data);
+    };
+    fetchStudent();
+  }, [userId]);
+
+  return student;
+}
+
 export default function StudentDashboard() {
   const { user, loading, signOut } = useAuth();
   const router = useRouter();
   const [activeView, setActiveView] = useState("dashboard");
   const [sortLevel, setSortLevel] = useState("College Level");
-  const [quizResults, setQuizResults] = useState([]);
+  const [quizResults, setQuizResults] = useState<any[]>([]);
   const [loadingData, setLoadingData] = useState(true);
-  const [studentProfile, setStudentProfile] = useState(null);
+  const [studentProfile, setStudentProfile] = useState<any>(null);
   const [classmates, setClassmates] = useState<any[]>([]);
   const [leaderboard, setLeaderboard] = useState<any[]>([]);
   const [analytics, setAnalytics] = useState({ averageScore: 0, totalQuizzes: 0, completed: 0 });
+  // Leaderboard state and fetch
+  const [activeLeaderboard, setActiveLeaderboard] = useState("College Level");
+  const [collegeStudents, setCollegeStudents] = useState<any[]>([]);
+  const [classStudents, setClassStudents] = useState<any[]>([]);
+  const [sectionStudents, setSectionStudents] = useState<any[]>([]);
+  const [downloading, setDownloading] = useState<string | null>(null);
 
   useEffect(() => {
     if (loading) return;
@@ -92,6 +118,20 @@ export default function StudentDashboard() {
       router.push("/login");
     }
   }, [user, loading, router]);
+
+  // Fetch student analytics fields from students table
+  useEffect(() => {
+    const fetchStudentAnalytics = async () => {
+      if (!user) return;
+      const { data, error } = await supabase
+        .from('students')
+        .select('avg_score, avg_accuracy, avg_time_spent, best_score, lowest_score, quizzes_taken')
+        .eq('id', user.id)
+        .single();
+      if (data) setStudentProfile((prev: any) => ({ ...prev, ...data }));
+    };
+    if (user) fetchStudentAnalytics();
+  }, [user]);
 
   useEffect(() => {
     const fetchProfile = async () => {
@@ -192,6 +232,7 @@ export default function StudentDashboard() {
         .select('*')
         .eq('department', studentProfile.department)
         .eq('section', studentProfile.section);
+      console.log('Fetched classmates:', classmatesData, 'For department:', studentProfile.department, 'section:', studentProfile.section);
       setClassmates(classmatesData || []);
       // Fetch leaderboard (same department and section, sorted by score desc)
       const { data: leaderboardData } = await supabase
@@ -223,6 +264,68 @@ export default function StudentDashboard() {
     if (user) fetchAnalytics();
   }, [user]);
 
+  useEffect(() => {
+    const fetchLeaderboards = async () => {
+      // College Level: all students, sorted by avg_score descending
+      const { data: college, error: collegeError } = await supabase
+        .from('students')
+        .select('id, name, department, section, avg_score, quizzes_taken')
+        .order('avg_score', { ascending: false });
+      console.log('College students:', college, 'Error:', collegeError);
+      setCollegeStudents(college || []);
+      // Department Level: students in same department, sorted by avg_score descending
+      if (studentProfile) {
+        const { data: dept, error: deptError } = await supabase
+          .from('students')
+          .select('id, name, department, section, avg_score, quizzes_taken')
+          .eq('department', studentProfile.department)
+          .order('avg_score', { ascending: false });
+        console.log('Department students:', dept, 'Error:', deptError);
+        setClassStudents(dept || []);
+      }
+      // Section Level: students in same department and section, sorted by avg_score descending
+      if (studentProfile) {
+        const { data: sect, error: sectError } = await supabase
+          .from('students')
+          .select('id, name, department, section, avg_score, quizzes_taken')
+          .eq('department', studentProfile.department)
+          .eq('section', studentProfile.section)
+          .order('avg_score', { ascending: false });
+        console.log('Section students:', sect, 'Error:', sectError);
+        setSectionStudents(sect || []);
+      }
+    };
+    if (studentProfile) fetchLeaderboards();
+  }, [studentProfile]);
+
+  useEffect(() => {
+    if (!studentProfile) return;
+    // Subscribe to all changes in the students table
+    const studentsChannel = supabase
+      .channel('students-leaderboard')
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'students',
+        },
+        (payload) => {
+          // Refetch all leaderboard levels on any change
+          // fetchLeaderboards is defined in the same scope
+          fetchLeaderboards();
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(studentsChannel);
+    };
+  }, [studentProfile]);
+
+  const student = useStudentProfile(user?.id);
+  const quizHistory = student?.quiz_history || [];
+
   if (loading || loadingData) {
     return (
       <div className="flex items-center justify-center min-h-screen bg-gray-50">
@@ -246,22 +349,61 @@ export default function StudentDashboard() {
   // Use quizResults for recent quizzes
   const recentQuizzes = quizResults.slice(0, 3);
 
-  // Use classmates and leaderboard from Supabase
-  // ... update the UI in renderClassmates and renderLeaderboard to use classmates and leaderboard arrays ...
+  // Enhanced analytics from quiz_results for the current student
+  const completedQuizzes = quizResults.filter(q => q.status === 'completed');
+  const avgScore = completedQuizzes.length
+    ? Math.round(completedQuizzes.reduce((sum, q) => sum + (q.score || 0), 0) / completedQuizzes.length)
+    : 0;
+  const avgAccuracy = completedQuizzes.length
+    ? Math.round(
+        completedQuizzes.reduce((sum, q) => sum + ((q.correct_answers || 0) / (q.total_questions || 1)), 0) / completedQuizzes.length * 100
+      )
+    : 0;
+  const avgTimeSpent = completedQuizzes.length
+    ? Math.round(completedQuizzes.reduce((sum, q) => sum + (q.time_spent || 0), 0) / completedQuizzes.length)
+    : 0;
+  const bestScore = completedQuizzes.length
+    ? Math.max(...completedQuizzes.map(q => q.score || 0))
+    : 0;
+  const worstScore = completedQuizzes.length
+    ? Math.min(...completedQuizzes.map(q => q.score || 0))
+    : 0;
+  const recentQuizzesHistory = completedQuizzes.slice(0, 5);
 
-  // Chart data
+  // Find most commonly missed question (by question id)
+  const missedCounts: Record<string, number> = {};
+  completedQuizzes.forEach(q => {
+    if (q.answers && typeof q.answers === 'object') {
+      Object.entries(q.answers).forEach(([qid, answer]) => {
+        // If answer is wrong, increment missed count
+        // (Assume you have access to quiz.questions to check correct answer, or store correct/incorrect in answers)
+        // For now, just count all answers (customize as needed)
+        // missedCounts[qid] = (missedCounts[qid] || 0) + 1;
+      });
+    }
+  });
+  // For demo, leave mostMissedQuestion blank (requires more data structure)
+  const mostMissedQuestion = Object.entries(missedCounts).sort((a, b) => b[1] - a[1])[0]?.[0] || 'N/A';
+
+  // Chart data: Use real quiz results for performance trend
+  const performanceTrend = quizResults
+    .filter(q => q.score !== null && q.taken_at)
+    .sort((a, b) => new Date(a.taken_at).getTime() - new Date(b.taken_at).getTime());
   const chartData = {
-    labels: ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul"],
+    labels: performanceTrend.map(q => {
+      const d = new Date(q.taken_at);
+      return `${d.getDate()}/${d.getMonth() + 1}`;
+    }),
     datasets: [
       {
         label: "Performance Trend",
-        data: [65, 72, 68, 75, 78, 76, 82],
+        data: performanceTrend.map(q => q.score),
         borderColor: "#3b82f6",
         backgroundColor: "rgba(59, 130, 246, 0.1)",
         tension: 0.4,
       },
     ],
-  }
+  };
 
   const chartOptions = {
     responsive: true,
@@ -281,6 +423,21 @@ export default function StudentDashboard() {
       },
     },
   }
+
+  // Subject performance: Calculate average score per subject
+  const subjectScores: Record<string, { total: number; count: number }> = {};
+  quizResults.forEach(q => {
+    const subject = q.quizzes?.subject || "Unknown";
+    if (!subjectScores[subject]) subjectScores[subject] = { total: 0, count: 0 };
+    if (q.score !== null) {
+      subjectScores[subject].total += q.score;
+      subjectScores[subject].count += 1;
+    }
+  });
+  const subjectPerformance = Object.entries(subjectScores).map(([subject, { total, count }]) => ({
+    subject,
+    avg: count > 0 ? Math.round(total / count) : 0,
+  }));
 
   const displayName = getDisplayName({ name: user.user_metadata?.full_name || user.user_metadata?.name, email: user.email })
   const firstName = getFirstName(displayName)
@@ -321,7 +478,6 @@ export default function StudentDashboard() {
             </div>
           </CardContent>
         </Card>
-
         <Card>
           <CardContent className="p-6">
             <div className="flex items-center justify-between">
@@ -339,7 +495,6 @@ export default function StudentDashboard() {
             </div>
           </CardContent>
         </Card>
-
         <Card>
           <CardContent className="p-6">
             <div className="flex items-center justify-between">
@@ -357,7 +512,6 @@ export default function StudentDashboard() {
             </div>
           </CardContent>
         </Card>
-
         <Card>
           <CardContent className="p-6">
             <div className="flex items-center justify-between">
@@ -376,12 +530,132 @@ export default function StudentDashboard() {
           </CardContent>
         </Card>
       </div>
+    </div>
+  )
 
-      {/* Recent Quizzes Table */}
+  const renderAnalytics = () => {
+    // Prepare data for performance trend graph
+    const quizHistorySorted = [...quizHistory].sort((a, b) => new Date(a.taken_at).getTime() - new Date(b.taken_at).getTime());
+    const chartData = {
+      labels: quizHistorySorted.map(q => q.taken_at ? new Date(q.taken_at).toLocaleDateString() : ""),
+      datasets: [
+        {
+          label: "Score",
+          data: quizHistorySorted.map(q => q.score),
+          borderColor: "#3b82f6",
+          backgroundColor: "rgba(59, 130, 246, 0.1)",
+          tension: 0.4,
+        },
+      ],
+    };
+    const chartOptions = {
+      responsive: true,
+      plugins: {
+        legend: { position: "top" },
+        title: { display: true, text: "Performance Over Time" },
+      },
+      scales: { y: { beginAtZero: true, max: 100 } },
+    };
+    return (
+      <div className="space-y-6">
+        <div>
+          <h1 className="text-2xl font-bold text-gray-900">Analytics</h1>
+          <p className="text-gray-600">Detailed performance insights</p>
+        </div>
+        {/* Analytics from students table */}
+        <div className="grid grid-cols-1 md:grid-cols-5 gap-6">
+          <Card>
+            <CardContent className="p-6">
+              <div className="text-sm text-gray-600 mb-1">Average Score</div>
+              <div className="text-3xl font-bold">{student?.avg_score ?? 0}%</div>
+            </CardContent>
+          </Card>
+          <Card>
+            <CardContent className="p-6">
+              <div className="text-sm text-gray-600 mb-1">Average Accuracy</div>
+              <div className="text-3xl font-bold">{student?.avg_accuracy ?? 0}%</div>
+            </CardContent>
+          </Card>
+          <Card>
+            <CardContent className="p-6">
+              <div className="text-sm text-gray-600 mb-1">Average Time Spent</div>
+              <div className="text-3xl font-bold">{Math.floor((student?.avg_time_spent ?? 0) / 60)}m {(student?.avg_time_spent ?? 0) % 60}s</div>
+            </CardContent>
+          </Card>
+          <Card>
+            <CardContent className="p-6">
+              <div className="text-sm text-gray-600 mb-1">Best Score</div>
+              <div className="text-3xl font-bold">{student?.best_score ?? 0}%</div>
+            </CardContent>
+          </Card>
+          <Card>
+            <CardContent className="p-6">
+              <div className="text-sm text-gray-600 mb-1">Lowest Score</div>
+              <div className="text-3xl font-bold">{student?.lowest_score ?? 0}%</div>
+            </CardContent>
+          </Card>
+        </div>
+        <div className="mt-4 text-lg font-medium">Quizzes Taken: {student?.quizzes_taken ?? 0}</div>
+        {/* Performance Trend Graph */}
+        <Card>
+          <CardHeader>
+            <CardTitle>Performance Trend</CardTitle>
+            <CardDescription>Your quiz performance over time</CardDescription>
+          </CardHeader>
+          <CardContent>
+            {quizHistory.length === 0 ? (
+              <div className="text-gray-500">No quiz data available.</div>
+            ) : (
+              <div className="h-96 min-h-[350px] w-full flex items-center justify-center bg-white rounded-lg border p-4">
+                <Line
+                  data={chartData}
+                  options={{
+                    ...chartOptions,
+                    maintainAspectRatio: false,
+                    scales: {
+                      ...chartOptions.scales,
+                      y: {
+                        ...chartOptions.scales.y,
+                        max: 20,
+                        min: 0,
+                        ticks: { stepSize: 1 }
+                      }
+                    }
+                  }}
+                  style={{ width: '100%', height: '100%' }}
+                />
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      </div>
+    );
+  }
+
+  // Real-time quizzes attended by the user (most recent first)
+  const attendedQuizzes = quizResults
+    .sort((a, b) => new Date(b.taken_at).getTime() - new Date(a.taken_at).getTime());
+
+  const renderQuizzes = () => (
+    <div className="space-y-6">
+      <div>
+        <h1 className="text-2xl font-bold text-gray-900">Quizzes</h1>
+        <p className="text-gray-600">All your quiz activities (real-time)</p>
+        <Button
+          variant="primary"
+          size="lg"
+          className="mt-6 mb-6 px-8 py-4 bg-blue-600 hover:bg-blue-700 text-white font-bold shadow-lg rounded-lg flex items-center gap-2 animate-pulse"
+          onClick={() => router.push('/quiz/join')}
+        >
+          <BookOpen className="w-5 h-5 mr-2" />
+          Attend Quiz
+        </Button>
+      </div>
+
+      {/* Table of All Attended Quizzes (Full History) */}
       <Card>
         <CardHeader>
-          <CardTitle>Recent Quizzes</CardTitle>
-          <CardDescription>Your latest quiz activities</CardDescription>
+          <CardTitle>Quiz History</CardTitle>
         </CardHeader>
         <CardContent>
           <div className="overflow-x-auto">
@@ -389,44 +663,28 @@ export default function StudentDashboard() {
               <thead>
                 <tr className="border-b">
                   <th className="text-left py-3 px-4 font-medium text-gray-600">Quiz</th>
-                  <th className="text-left py-3 px-4 font-medium text-gray-600">Subject</th>
-                  <th className="text-left py-3 px-4 font-medium text-gray-600">Duration</th>
-                  <th className="text-left py-3 px-4 font-medium text-gray-600">Date</th>
                   <th className="text-left py-3 px-4 font-medium text-gray-600">Score</th>
-                  <th className="text-left py-3 px-4 font-medium text-gray-600">Status</th>
+                  <th className="text-left py-3 px-4 font-medium text-gray-600">Accuracy</th>
+                  <th className="text-left py-3 px-4 font-medium text-gray-600">Time Spent</th>
+                  <th className="text-left py-3 px-4 font-medium text-gray-600">Date</th>
                 </tr>
               </thead>
               <tbody>
-                {recentQuizzes.map((quiz) => (
-                  <tr key={quiz.id} className="border-b hover:bg-gray-50">
-                    <td className="py-3 px-4 font-medium">{quiz.quizzes.title}</td>
-                    <td className="py-3 px-4">{quiz.quizzes.subject}</td>
-                    <td className="py-3 px-4">
-                      <div className="flex items-center">
-                        <Clock className="w-4 h-4 mr-1 text-gray-400" />
-                        {quiz.quizzes.duration}
-                      </div>
-                    </td>
-                    <td className="py-3 px-4">{quiz.taken_at}</td>
-                    <td className="py-3 px-4">
-                      {quiz.score ? (
-                        <span className="font-semibold">{quiz.score}%</span>
-                      ) : (
-                        <span className="text-gray-400">-</span>
-                      )}
-                    </td>
-                    <td className="py-3 px-4">
-                      <Badge
-                        variant={quiz.status === "completed" ? "default" : "secondary"}
-                        className={
-                          quiz.status === "completed" ? "bg-green-100 text-green-800" : "bg-gray-100 text-gray-800"
-                        }
-                      >
-                        {quiz.status === "completed" ? "Completed" : "Available"}
-                      </Badge>
-                    </td>
+                {quizHistory.length > 0 ? (
+                  quizHistory.map((quiz, idx) => (
+                    <tr key={idx} className="border-b hover:bg-gray-50">
+                      <td className="py-3 px-4 font-medium">{quiz.title || quiz.quiz_id}</td>
+                      <td className="py-3 px-4">{quiz.score}%</td>
+                      <td className="py-3 px-4">{Math.round((quiz.correct_answers / quiz.total_questions) * 100)}%</td>
+                      <td className="py-3 px-4">{Math.floor(quiz.time_spent / 60)}m {quiz.time_spent % 60}s</td>
+                      <td className="py-3 px-4">{quiz.taken_at ? new Date(quiz.taken_at).toLocaleString() : ''}</td>
+                    </tr>
+                  ))
+                ) : (
+                  <tr>
+                    <td colSpan={5} className="text-center py-6 text-gray-400">No quizzes taken yet.</td>
                   </tr>
-                ))}
+                )}
               </tbody>
             </table>
           </div>
@@ -435,286 +693,191 @@ export default function StudentDashboard() {
     </div>
   )
 
-  const renderAnalytics = () => (
-    <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-bold text-gray-900">Analytics</h1>
-        <p className="text-gray-600">Detailed performance insights</p>
-      </div>
+  // Replace renderClassmates with renderDownloadQuestions
+  const renderDownloadQuestions = (downloading, setDownloading) => {
+    console.log('Full quizHistory:', quizHistory);
+    const handleDownload = async (quiz) => {
+      const quizId = quiz.quiz_id || quiz.id;
+      console.log('Attempting to fetch quiz with id:', quizId, 'from quiz object:', quiz);
+      if (!quizId) {
+        alert('Quiz ID is missing for this quiz history entry. Quiz object: ' + JSON.stringify(quiz));
+        return;
+      }
+      setDownloading(quizId);
+      try {
+        // Fetch quiz questions from quizzes table using quiz_id
+        const { data: quizData, error } = await supabase
+          .from('quizzes')
+          .select('questions, title')
+          .eq('id', quizId)
+          .single();
+        console.log('Fetched quizData:', quizData, 'Error:', error);
+        if (error || !quizData || !quizData.questions) {
+          alert('Could not fetch questions for this quiz. Used quizId: ' + quizId + '\nQuiz object: ' + JSON.stringify(quiz) + '\nSupabase error: ' + (error ? JSON.stringify(error) : 'No error object') + '\nQuizData: ' + JSON.stringify(quizData));
+          setDownloading(null);
+          return;
+        }
+        const questions = quizData.questions;
+        const doc = new jsPDF();
+        doc.setFontSize(16);
+        doc.text(quiz.title || quizData.title || quizId || 'Quiz', 10, 15);
+        doc.setFontSize(12);
+        let y = 30;
+        questions.forEach((q, idx) => {
+          doc.text(`${idx + 1}. ${q.question}`, 10, y);
+          y += 8;
+          // Get student's answer
+          let studentAnswer = quiz.answers ? quiz.answers[q.id] : undefined;
+          let studentAnswerText = 'N/A';
+          if (q.type === 'multiple-choice' && Array.isArray(q.options) && typeof studentAnswer === 'number') {
+            studentAnswerText = q.options[studentAnswer] ?? 'N/A';
+          } else if (q.type === 'true-false' && Array.isArray(q.options)) {
+            if (typeof studentAnswer === 'string') {
+              studentAnswerText = studentAnswer.charAt(0).toUpperCase() + studentAnswer.slice(1);
+            } else if (typeof studentAnswer === 'number') {
+              studentAnswerText = q.options[studentAnswer] ?? 'N/A';
+            }
+          } else if (typeof studentAnswer === 'string') {
+            studentAnswerText = studentAnswer;
+          }
+          doc.text(`Your answer: ${studentAnswerText}`, 14, y);
+          y += 8;
+          // Handle correct answer for different question types
+          let correctAnswerText = 'N/A';
+          if (q.type === 'multiple-choice' && Array.isArray(q.options) && typeof q.correctAnswer === 'number') {
+            correctAnswerText = q.options[q.correctAnswer] ?? 'N/A';
+          } else if (q.type === 'true-false' && Array.isArray(q.options)) {
+            if (typeof q.correctAnswer === 'string') {
+              correctAnswerText = q.correctAnswer.charAt(0).toUpperCase() + q.correctAnswer.slice(1);
+            } else if (typeof q.correctAnswer === 'number') {
+              correctAnswerText = q.options[q.correctAnswer] ?? 'N/A';
+            }
+          } else if (typeof q.correctAnswer === 'string') {
+            correctAnswerText = q.correctAnswer;
+          }
+          doc.text(`Correct answer: ${correctAnswerText}`, 14, y);
+          y += 8;
+          if (q.description) {
+            doc.text(`Explanation: ${q.description}`, 14, y);
+            y += 10;
+          } else {
+            y += 2;
+          }
+          y += 2;
+          if (y > 270) { doc.addPage(); y = 20; }
+        });
+        doc.save(`${quiz.title || quizData.title || quizId || 'quiz'}.pdf`);
+      } catch (e) {
+        alert('An error occurred while generating the PDF.');
+      }
+      setDownloading(null);
+    };
 
-      {/* Sort Buttons */}
-      <div className="flex gap-2">
-        {["College Level", "Department Level", "Section Level"].map((level) => (
-          <Button
-            key={level}
-            variant={sortLevel === level ? "default" : "outline"}
-            onClick={() => setSortLevel(level)}
-            className={sortLevel === level ? "bg-blue-600" : ""}
-          >
-            {level}
-          </Button>
-        ))}
-      </div>
-
-      {/* Performance Chart */}
-      <Card>
-        <CardHeader>
-          <CardTitle>Performance Trend</CardTitle>
-          <CardDescription>Your quiz performance over time</CardDescription>
-        </CardHeader>
-        <CardContent>
-          <div className="h-80">
-            <Line data={chartData} options={chartOptions} />
-          </div>
-        </CardContent>
-      </Card>
-
-      {/* Subject Performance */}
-      <Card>
-        <CardHeader>
-          <CardTitle>Subject Performance</CardTitle>
-          <CardDescription>Your performance across different subjects</CardDescription>
-        </CardHeader>
-        <CardContent>
-          <div className="space-y-4">
-            {/* This section will be updated to use real data from Supabase */}
-            <div key="Mathematics" className="space-y-2">
-              <div className="flex justify-between">
-                <span className="font-medium">Mathematics</span>
-                <span className="font-semibold">88%</span>
-              </div>
-              <Progress value={88} className="h-2" />
-            </div>
-            <div key="Physics" className="space-y-2">
-              <div className="flex justify-between">
-                <span className="font-medium">Physics</span>
-                <span className="font-semibold">92%</span>
-              </div>
-              <Progress value={92} className="h-2" />
-            </div>
-            <div key="History" className="space-y-2">
-              <div className="flex justify-between">
-                <span className="font-medium">History</span>
-                <span className="font-semibold">85%</span>
-              </div>
-              <Progress value={85} className="h-2" />
-            </div>
-            <div key="English" className="space-y-2">
-              <div className="flex justify-between">
-                <span className="font-medium">English</span>
-                <span className="font-semibold">90%</span>
-              </div>
-              <Progress value={90} className="h-2" />
-            </div>
-          </div>
-        </CardContent>
-      </Card>
-    </div>
-  )
-
-  const renderQuizzes = () => (
-    <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-bold text-gray-900">Quizzes</h1>
-        <p className="text-gray-600">All your quiz activities</p>
-        <Button
-          variant="primary"
-          className="mt-4"
-          onClick={() => router.push('/quiz/join')}
-        >
-          Attend Quiz
-        </Button>
-      </div>
-
-      <div className="grid gap-4">
-        {quizResults.map((quiz) => (
-          <Card key={quiz.id} className="hover:shadow-md transition-shadow">
-            <CardContent className="p-6">
-              <div className="flex items-center justify-between">
-                <div className="flex-1">
-                  <div className="flex items-center gap-2 mb-2">
-                    <h3 className="font-semibold text-lg">{quiz.quizzes.title}</h3>
-                    <Badge
-                      variant="outline"
-                      className={
-                        quiz.quizzes.difficulty === "Easy"
-                          ? "border-green-200 text-green-700"
-                          : quiz.quizzes.difficulty === "Medium"
-                            ? "border-yellow-200 text-yellow-700"
-                            : "border-red-200 text-red-700"
-                      }
-                    >
-                      {quiz.quizzes.difficulty}
-                    </Badge>
-                  </div>
-                  <div className="flex items-center gap-4 text-sm text-gray-600">
-                    <span>{quiz.quizzes.subject}</span>
-                    <div className="flex items-center">
-                      <Clock className="w-4 h-4 mr-1" />
-                      {quiz.quizzes.duration}
-                    </div>
-                    <span>{quiz.taken_at}</span>
-                    <span>{quiz.attempts} attempts</span>
-                  </div>
-                </div>
-                <div className="flex items-center gap-4">
-                  <div className="text-right">
-                    <Badge
-                      variant={quiz.status === "completed" ? "default" : "secondary"}
-                      className={
-                        quiz.status === "completed"
-                          ? "bg-green-100 text-green-800"
-                          : quiz.status === "available"
-                            ? "bg-blue-100 text-blue-800"
-                            : "bg-gray-100 text-gray-800"
-                      }
-                    >
-                      {quiz.status}
-                    </Badge>
-                    {quiz.score && <div className="text-lg font-bold mt-1">{quiz.score}%</div>}
-                  </div>
-                  <Button variant="outline" size="sm">
-                    <Eye className="w-4 h-4" />
-                  </Button>
-                </div>
-              </div>
-            </CardContent>
-          </Card>
-        ))}
-      </div>
-    </div>
-  )
-
-  const renderClassmates = () => (
-    <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-bold text-gray-900">Classmates</h1>
-        <p className="text-gray-600">Connect with your section peers</p>
-      </div>
-
-      <Card>
-        <CardHeader>
-          <CardTitle>Section Classmates</CardTitle>
-          <CardDescription>Computer Science - Section A & B</CardDescription>
-        </CardHeader>
-        <CardContent>
-          <div className="space-y-3">
-            {classmates.map((student, index) => (
-              <div
-                key={student.id}
-                className={`flex items-center justify-between p-4 rounded-lg ${
-                  student.id === user.id ? "bg-blue-50 border border-blue-200" : "bg-gray-50"
-                }`}
-              >
-                <div className="flex items-center gap-3">
-                  <div className="relative">
-                    <Avatar className="w-10 h-10">
-                      <AvatarFallback className="bg-blue-100 text-blue-600">
-                        {student.name
-                          ? student.name.split(" ").map((n) => n[0]).join("").toUpperCase()
-                          : student.email
-                            ? student.email[0].toUpperCase()
-                            : "NA"}
-                      </AvatarFallback>
-                    </Avatar>
-                    <div
-                      className={`absolute -bottom-1 -right-1 w-3 h-3 rounded-full border-2 border-white ${
-                        student.online ? "bg-green-500" : "bg-gray-400"
-                      }`}
-                    />
-                  </div>
-                  <div>
-                    <div className="font-medium">
-                      {student.name}
-                      {student.id === user.id && <span className="text-blue-600 ml-1">(You)</span>}
-                    </div>
-                    <div className="text-sm text-gray-600">{student.section}</div>
-                  </div>
-                </div>
-                <div className="text-right">
-                  <div className="font-semibold">{student.score}%</div>
-                  <div className="text-sm text-gray-600">Rank #{student.rank}</div>
-                </div>
-              </div>
-            ))}
-          </div>
-        </CardContent>
-      </Card>
-    </div>
-  )
-
-  const renderLeaderboard = () => (
-    <div className="space-y-6">
-      <div className="flex items-center justify-between">
+    return (
+      <div className="space-y-6">
         <div>
-          <h1 className="text-2xl font-bold text-gray-900">Leaderboard</h1>
-          <p className="text-gray-600">See how you rank against peers</p>
+          <h1 className="text-2xl font-bold text-gray-900">Download Questions</h1>
+          <p className="text-gray-600">Download your quiz questions and answers as PDF</p>
         </div>
-        <div className="flex items-center gap-2 text-sm text-gray-600">
-          <div className="w-2 h-2 bg-red-500 rounded-full animate-pulse" />
-          Live • Updates every 30 seconds
-        </div>
-      </div>
-
-      {/* Sort Buttons */}
-      <div className="flex gap-2">
-        {["College Level", "Department Level", "Section Level"].map((level) => (
-          <Button
-            key={level}
-            variant={sortLevel === level ? "default" : "outline"}
-            onClick={() => setSortLevel(level)}
-            className={sortLevel === level ? "bg-blue-600" : ""}
-          >
-            {level}
-          </Button>
-        ))}
-      </div>
-
-      <Card>
-        <CardHeader>
-          <CardTitle>Rankings</CardTitle>
-          <CardDescription>Current standings based on quiz performance</CardDescription>
-        </CardHeader>
-        <CardContent>
-          <div className="space-y-3">
-            {leaderboard.map((student, index) => (
-              <div
-                key={student.id}
-                className={`flex items-center justify-between p-4 rounded-lg ${
-                  student.id === user.id ? "bg-blue-50 border-l-4 border-blue-500" : "bg-gray-50"
-                }`}
-              >
-                <div className="flex items-center gap-4">
-                  <div
-                    className={`w-8 h-8 rounded-full flex items-center justify-center font-bold text-sm ${
-                      index < 3 ? "bg-yellow-500 text-white" : "bg-gray-200 text-gray-700"
-                    }`}
-                  >
-                    {index < 3 ? <Trophy className="w-4 h-4" /> : index + 1}
-                  </div>
-                  <div>
-                    <div className="flex items-center gap-2">
-                      <span className="font-medium">{student.name}</span>
-                      {index < 3 && <Star className="w-4 h-4 text-yellow-500" />}
-                    </div>
-                    <div className="text-sm text-gray-600">
-                      {student.department} • {student.section}
-                    </div>
-                  </div>
-                </div>
-                <div className="text-right">
-                  <div className="font-bold text-lg">{student.score}%</div>
-                  <div className="text-sm text-gray-600">
-                    {student.quizzes} quizzes • {student.average}% avg
-                  </div>
-                </div>
+        <div className="space-y-4">
+          {quizHistory.length === 0 ? (
+            <div className="text-gray-500">No quiz history available.</div>
+          ) : (
+            quizHistory.map((quiz, idx) => (
+              <div key={idx} className="flex items-center justify-between p-4 bg-white rounded shadow">
+                <div className="font-medium">{quiz.title || quiz.quiz_id}</div>
+                <button
+                  className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 font-semibold shadow disabled:opacity-60"
+                  onClick={() => handleDownload(quiz)}
+                  disabled={downloading === (quiz.quiz_id || quiz.id)}
+                >
+                  {downloading === (quiz.quiz_id || quiz.id) ? 'Downloading...' : 'Download PDF'}
+                </button>
               </div>
-            ))}
+            ))
+          )}
+        </div>
+      </div>
+    );
+  };
+
+  const renderLeaderboard = () => {
+    let leaderboardData = [];
+    if (activeLeaderboard === "College Level") leaderboardData = collegeStudents;
+    else if (activeLeaderboard === "Department Level") leaderboardData = classStudents;
+    else leaderboardData = sectionStudents;
+    console.log('Rendering leaderboardData:', leaderboardData);
+    return (
+      <div className="space-y-6">
+        <div className="flex items-center justify-between">
+          <div>
+            <h1 className="text-2xl font-bold text-gray-900">Leaderboard</h1>
+            <p className="text-gray-600">See how you rank against peers</p>
           </div>
-        </CardContent>
-      </Card>
-    </div>
-  )
+          <div className="flex items-center gap-2 text-sm text-gray-600">
+            <div className="w-2 h-2 bg-red-500 rounded-full animate-pulse" />
+            Live • Updates every 30 seconds
+          </div>
+        </div>
+        {/* Tabs for leaderboard level */}
+        <div className="flex gap-2 mb-4">
+          {["College Level", "Department Level", "Section Level"].map((level) => (
+            <Button
+              key={level}
+              variant={activeLeaderboard === level ? "default" : "outline"}
+              onClick={() => setActiveLeaderboard(level)}
+              className={activeLeaderboard === level ? "bg-blue-600" : ""}
+            >
+              {level}
+            </Button>
+          ))}
+        </div>
+        <Card>
+          <CardHeader>
+            <CardTitle>Rankings</CardTitle>
+            <CardDescription>Current standings based on quiz performance</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <div className="space-y-3">
+              {leaderboardData.map((studentRow, index) => (
+                <div
+                  key={studentRow.id}
+                  className={`flex items-center justify-between p-4 rounded-lg ${
+                    studentRow.id === student?.id ? "bg-blue-50 border-l-4 border-blue-500" : "bg-gray-50"
+                  }`}
+                >
+                  <div className="flex items-center gap-4">
+                    <div
+                      className={`w-8 h-8 rounded-full flex items-center justify-center font-bold text-sm ${
+                        index < 3 ? "bg-yellow-500 text-white" : "bg-gray-200 text-gray-700"
+                      }`}
+                    >
+                      {index < 3 ? <Trophy className="w-4 h-4" /> : index + 1}
+                    </div>
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <span className="font-medium">{studentRow.name}</span>
+                        {index < 3 && <Star className="w-4 h-4 text-yellow-500" />}
+                      </div>
+                      <div className="text-sm text-gray-600">
+                        {studentRow.department} • {studentRow.section}
+                      </div>
+                    </div>
+                  </div>
+                  <div className="text-right">
+                    <div className="font-bold text-lg">{studentRow.avg_score ?? 0}%</div>
+                    <div className="text-sm text-gray-600">
+                      {studentRow.quizzes_taken} quizzes
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+    );
+  };
 
   const renderSettings = () => (
     <div className="space-y-6">
@@ -791,7 +954,7 @@ export default function StudentDashboard() {
       case "quizzes":
         return renderQuizzes()
       case "classmates":
-        return renderClassmates()
+        return renderDownloadQuestions(downloading, setDownloading);
       case "leaderboard":
         return renderLeaderboard()
       case "settings":
