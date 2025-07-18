@@ -158,7 +158,7 @@ export async function updateStudentQuizHistory(studentId: string) {
   // Fetch all quiz results for the student
   const { data: results, error: resultsError } = await supabase
     .from('quiz_results')
-    .select('quiz_id, score, correct_answers, total_questions, time_spent, taken_at')
+    .select('quiz_id, score, correct_answers, total_questions, time_spent, taken_at, answers')
     .eq('student_id', studentId)
     .order('taken_at', { ascending: false });
   if (resultsError) {
@@ -189,6 +189,7 @@ export async function updateStudentQuizHistory(studentId: string) {
     total_questions: r.total_questions,
     time_spent: r.time_spent,
     taken_at: r.taken_at,
+    answers: r.answers, // include answers for PDF and evaluation
   }));
   // Update the student's quiz_history field
   const { error: updateError } = await supabase

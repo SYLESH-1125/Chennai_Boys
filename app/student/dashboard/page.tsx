@@ -94,7 +94,40 @@ function useStudentProfile(userId: any) {
   return student;
 }
 
+// Add a helper function for formatting time
+function formatTime(seconds: number) {
+  if (!seconds || isNaN(seconds) || seconds < 0) seconds = 0;
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = seconds % 60;
+  return `${minutes}m ${remainingSeconds}s`;
+}
+
+// Calculate streak (consecutive days with at least one quiz taken)
+function calculateStreak(quizHistory: any[]) {
+  if (!quizHistory || quizHistory.length === 0) return 0;
+  // Sort by date descending
+  const sorted = [...quizHistory].sort((a, b) => new Date(b.taken_at).getTime() - new Date(a.taken_at).getTime());
+  let streak = 1;
+  let prevDate = new Date(sorted[0].taken_at);
+  for (let i = 1; i < sorted.length; i++) {
+    const currDate = new Date(sorted[i].taken_at);
+    // Check if previous date is exactly 1 day after current
+    const diff = (prevDate.getTime() - currDate.getTime()) / (1000 * 60 * 60 * 24);
+    if (diff >= 1 && diff < 2) {
+      streak++;
+      prevDate = currDate;
+    } else if (diff < 1) {
+      // Same day, skip
+      continue;
+    } else {
+      break;
+    }
+  }
+  return streak;
+}
+
 export default function StudentDashboard() {
+  console.log("StudentDashboard rendered");
   const { user, loading, signOut } = useAuth();
   const router = useRouter();
   const [activeView, setActiveView] = useState("dashboard");
@@ -111,6 +144,54 @@ export default function StudentDashboard() {
   const [classStudents, setClassStudents] = useState<any[]>([]);
   const [sectionStudents, setSectionStudents] = useState<any[]>([]);
   const [downloading, setDownloading] = useState<string | null>(null);
+  const [allStudents, setAllStudents] = useState<any[]>([]);
+  // Add leaderboard scope state
+  const [leaderboardScope, setLeaderboardScope] = useState("College");
+  const leaderboardScopes = [
+    { label: "College", value: "College" },
+    { label: "Department", value: "Department" },
+    { label: "Section", value: "Section" },
+  ];
+
+  // Define fetchLeaderboards at the top level
+  const fetchLeaderboards = async () => {
+    // Debug log for studentProfile
+    console.log('studentProfile:', studentProfile);
+    // Fetch all students for debugging
+    const { data: all, error } = await supabase
+      .from('students')
+      .select('id, full_name, department, section, avg_score, quizzes_taken');
+    console.log('All students:', all);
+    setAllStudents(all || []);
+    // College Level: all students, sorted by avg_score
+    const { data: college, error: collegeError } = await supabase
+      .from('students')
+      .select('id, full_name, department, section, avg_score, quizzes_taken')
+      .order('avg_score', { ascending: false });
+    console.log('College fetch:', college, 'Error:', collegeError);
+    setCollegeStudents(college || []);
+    // Department Level: students in same department, sorted by avg_score
+    if (studentProfile && studentProfile.department) {
+      const { data: dept, error: deptError } = await supabase
+        .from('students')
+        .select('id, full_name, department, section, avg_score, quizzes_taken')
+        .eq('department', studentProfile.department)
+        .order('avg_score', { ascending: false });
+      console.log('Department fetch:', dept, 'Error:', deptError, 'Filter:', studentProfile.department);
+      setClassStudents(dept || []);
+      // Section Level: students in same department and section, sorted by avg_score
+      if (studentProfile.section) {
+        const { data: sect, error: sectError } = await supabase
+          .from('students')
+          .select('id, full_name, department, section, avg_score, quizzes_taken')
+          .eq('department', studentProfile.department)
+          .eq('section', studentProfile.section)
+          .order('avg_score', { ascending: false });
+        console.log('Section fetch:', sect, 'Error:', sectError, 'Filter:', studentProfile.department, studentProfile.section);
+        setSectionStudents(sect || []);
+      }
+    }
+  };
 
   useEffect(() => {
     if (loading) return;
@@ -188,13 +269,7 @@ export default function StudentDashboard() {
           .eq('department', studentProfile.department)
           .eq('section', studentProfile.section);
         setClassmates(classmatesData || []);
-        const { data: leaderboardData } = await supabase
-          .from('students')
-          .select('*')
-          .eq('department', studentProfile.department)
-          .eq('section', studentProfile.section)
-          .order('score', { ascending: false });
-        setLeaderboard(leaderboardData || []);
+        // fetchLeaderboards(); // This is now handled by the top-level fetchLeaderboards
       }
     };
 
@@ -234,14 +309,7 @@ export default function StudentDashboard() {
         .eq('section', studentProfile.section);
       console.log('Fetched classmates:', classmatesData, 'For department:', studentProfile.department, 'section:', studentProfile.section);
       setClassmates(classmatesData || []);
-      // Fetch leaderboard (same department and section, sorted by score desc)
-      const { data: leaderboardData } = await supabase
-        .from('students')
-        .select('*')
-        .eq('department', studentProfile.department)
-        .eq('section', studentProfile.section)
-        .order('score', { ascending: false });
-      setLeaderboard(leaderboardData || []);
+      // fetchLeaderboards(); // This is now handled by the top-level fetchLeaderboards
     };
     if (studentProfile) fetchClassmatesAndLeaderboard();
   }, [studentProfile]);
@@ -265,37 +333,10 @@ export default function StudentDashboard() {
   }, [user]);
 
   useEffect(() => {
-    const fetchLeaderboards = async () => {
-      // College Level: all students, sorted by avg_score descending
-      const { data: college, error: collegeError } = await supabase
-        .from('students')
-        .select('id, name, department, section, avg_score, quizzes_taken')
-        .order('avg_score', { ascending: false });
-      console.log('College students:', college, 'Error:', collegeError);
-      setCollegeStudents(college || []);
-      // Department Level: students in same department, sorted by avg_score descending
-      if (studentProfile) {
-        const { data: dept, error: deptError } = await supabase
-          .from('students')
-          .select('id, name, department, section, avg_score, quizzes_taken')
-          .eq('department', studentProfile.department)
-          .order('avg_score', { ascending: false });
-        console.log('Department students:', dept, 'Error:', deptError);
-        setClassStudents(dept || []);
-      }
-      // Section Level: students in same department and section, sorted by avg_score descending
-      if (studentProfile) {
-        const { data: sect, error: sectError } = await supabase
-          .from('students')
-          .select('id, name, department, section, avg_score, quizzes_taken')
-          .eq('department', studentProfile.department)
-          .eq('section', studentProfile.section)
-          .order('avg_score', { ascending: false });
-        console.log('Section students:', sect, 'Error:', sectError);
-        setSectionStudents(sect || []);
-      }
-    };
-    if (studentProfile) fetchLeaderboards();
+    console.log('useEffect studentProfile:', studentProfile);
+    if (studentProfile) {
+      fetchLeaderboards();
+    }
   }, [studentProfile]);
 
   useEffect(() => {
@@ -325,6 +366,7 @@ export default function StudentDashboard() {
 
   const student = useStudentProfile(user?.id);
   const quizHistory = student?.quiz_history || [];
+  const streak = calculateStreak(quizHistory);
 
   if (loading || loadingData) {
     return (
@@ -339,11 +381,13 @@ export default function StudentDashboard() {
   }
 
   // Calculate stats from quizResults
+  // Find user's rank in section leaderboard
+  const sectionRank = sectionStudents.findIndex(s => s.id === user.id) + 1;
   const stats = {
     totalQuizzes: analytics.totalQuizzes,
     completed: analytics.completed,
     averageScore: analytics.averageScore,
-    classRank: leaderboard.findIndex(l => l.id === user.id) + 1 || 1
+    classRank: sectionRank > 0 ? sectionRank : '-'
   };
 
   // Use quizResults for recent quizzes
@@ -351,7 +395,11 @@ export default function StudentDashboard() {
 
   // Enhanced analytics from quiz_results for the current student
   const completedQuizzes = quizResults.filter(q => q.status === 'completed');
-  const avgScore = completedQuizzes.length
+  const avgCorrectAnswers = completedQuizzes.length
+    ? Math.round(completedQuizzes.reduce((sum, q) => sum + (q.correct_answers || 0), 0) / completedQuizzes.length)
+    : 0;
+  // Calculate average percent score for completed quizzes
+  const avgPercentScore = completedQuizzes.length
     ? Math.round(completedQuizzes.reduce((sum, q) => sum + (q.score || 0), 0) / completedQuizzes.length)
     : 0;
   const avgAccuracy = completedQuizzes.length
@@ -405,24 +453,27 @@ export default function StudentDashboard() {
     ],
   };
 
+  // Fix chart options legend position type
   const chartOptions = {
     responsive: true,
     plugins: {
       legend: {
-        position: "top" as const,
+        position: 'top',
       },
       title: {
         display: true,
-        text: "Performance Over Time",
+        text: 'Performance Over Time',
       },
     },
     scales: {
       y: {
-        beginAtZero: true,
+        beginAtZero: false,
+        min: 10,
         max: 100,
+        ticks: { stepSize: 10 },
       },
     },
-  }
+  };
 
   // Subject performance: Calculate average score per subject
   const subjectScores: Record<string, { total: number; count: number }> = {};
@@ -447,7 +498,7 @@ export default function StudentDashboard() {
     { key: "dashboard", label: "Dashboard", icon: Home },
     { key: "analytics", label: "Analytics", icon: BarChart3 },
     { key: "quizzes", label: "Quizzes", icon: BookOpen },
-    { key: "classmates", label: "Classmates", icon: Users },
+    { key: "classmates", label: "Download", icon: Users },
     { key: "leaderboard", label: "Leaderboard", icon: Trophy },
     { key: "settings", label: "Settings", icon: Settings },
   ]
@@ -530,6 +581,32 @@ export default function StudentDashboard() {
           </CardContent>
         </Card>
       </div>
+      {/* About and Tips Section */}
+      <div className="mt-10 max-w-4xl mx-auto w-full">
+        <Card className="bg-gradient-to-br from-white to-blue-50 shadow-lg border border-blue-100">
+          <CardContent className="p-10 flex flex-col md:flex-row items-center gap-8">
+            <div className="flex-1">
+              <h2 className="text-2xl font-bold mb-3">About the Quiz Portal</h2>
+              <p className="text-gray-700 mb-5">
+                Welcome to the Quiz Portal! Here you can join quizzes, track your progress, and compete with classmates. Your dashboard gives you a real-time overview of your quiz activity and performance.
+              </p>
+              <h3 className="text-lg font-semibold mb-2">Tips for Success:</h3>
+              <ul className="list-disc list-inside text-gray-600 space-y-1">
+                <li>Attend quizzes regularly to improve your rank.</li>
+                <li>Review your quiz history and analytics to identify areas for improvement.</li>
+                <li>Check the leaderboard to see how you compare with your peers.</li>
+                <li>Download your quiz results for revision.</li>
+              </ul>
+                      </div>
+            <div className="flex-1 flex flex-col items-center justify-center">
+              <span className="text-7xl mb-4">📚</span>
+              <blockquote className="italic text-blue-700 text-center">
+                "Success is the sum of small efforts, repeated day in and day out."
+              </blockquote>
+          </div>
+        </CardContent>
+      </Card>
+      </div>
     </div>
   )
 
@@ -551,58 +628,46 @@ export default function StudentDashboard() {
     const chartOptions = {
       responsive: true,
       plugins: {
-        legend: { position: "top" },
+        legend: { position: 'top' },
         title: { display: true, text: "Performance Over Time" },
       },
       scales: { y: { beginAtZero: true, max: 100 } },
     };
     return (
-      <div className="space-y-6">
-        <div>
-          <h1 className="text-2xl font-bold text-gray-900">Analytics</h1>
-          <p className="text-gray-600">Detailed performance insights</p>
-        </div>
+    <div className="space-y-6">
+      <div>
+        <h1 className="text-2xl font-bold text-gray-900">Analytics</h1>
+        <p className="text-gray-600">Detailed performance insights</p>
+      </div>
         {/* Analytics from students table */}
         <div className="grid grid-cols-1 md:grid-cols-5 gap-6">
-          <Card>
+          <Card className="min-w-[180px] max-w-full flex-1">
             <CardContent className="p-6">
               <div className="text-sm text-gray-600 mb-1">Average Score</div>
               <div className="text-3xl font-bold">{student?.avg_score ?? 0}%</div>
             </CardContent>
           </Card>
-          <Card>
-            <CardContent className="p-6">
-              <div className="text-sm text-gray-600 mb-1">Average Accuracy</div>
-              <div className="text-3xl font-bold">{student?.avg_accuracy ?? 0}%</div>
-            </CardContent>
-          </Card>
-          <Card>
-            <CardContent className="p-6">
-              <div className="text-sm text-gray-600 mb-1">Average Time Spent</div>
-              <div className="text-3xl font-bold">{Math.floor((student?.avg_time_spent ?? 0) / 60)}m {(student?.avg_time_spent ?? 0) % 60}s</div>
-            </CardContent>
-          </Card>
-          <Card>
+          <Card className="min-w-[180px] max-w-full flex-1">
             <CardContent className="p-6">
               <div className="text-sm text-gray-600 mb-1">Best Score</div>
               <div className="text-3xl font-bold">{student?.best_score ?? 0}%</div>
             </CardContent>
           </Card>
-          <Card>
+          <Card className="min-w-[180px] max-w-full flex-1">
             <CardContent className="p-6">
               <div className="text-sm text-gray-600 mb-1">Lowest Score</div>
               <div className="text-3xl font-bold">{student?.lowest_score ?? 0}%</div>
             </CardContent>
           </Card>
-        </div>
+      </div>
         <div className="mt-4 text-lg font-medium">Quizzes Taken: {student?.quizzes_taken ?? 0}</div>
         {/* Performance Trend Graph */}
-        <Card>
-          <CardHeader>
-            <CardTitle>Performance Trend</CardTitle>
-            <CardDescription>Your quiz performance over time</CardDescription>
-          </CardHeader>
-          <CardContent>
+      <Card>
+        <CardHeader>
+          <CardTitle>Performance Trend</CardTitle>
+          <CardDescription>Your quiz performance over time</CardDescription>
+        </CardHeader>
+        <CardContent>
             {quizHistory.length === 0 ? (
               <div className="text-gray-500">No quiz data available.</div>
             ) : (
@@ -612,23 +677,14 @@ export default function StudentDashboard() {
                   options={{
                     ...chartOptions,
                     maintainAspectRatio: false,
-                    scales: {
-                      ...chartOptions.scales,
-                      y: {
-                        ...chartOptions.scales.y,
-                        max: 20,
-                        min: 0,
-                        ticks: { stepSize: 1 }
-                      }
-                    }
                   }}
                   style={{ width: '100%', height: '100%' }}
                 />
-              </div>
+          </div>
             )}
-          </CardContent>
-        </Card>
-      </div>
+        </CardContent>
+      </Card>
+              </div>
     );
   }
 
@@ -642,7 +698,7 @@ export default function StudentDashboard() {
         <h1 className="text-2xl font-bold text-gray-900">Quizzes</h1>
         <p className="text-gray-600">All your quiz activities (real-time)</p>
         <Button
-          variant="primary"
+          variant="default"
           size="lg"
           className="mt-6 mb-6 px-8 py-4 bg-blue-600 hover:bg-blue-700 text-white font-bold shadow-lg rounded-lg flex items-center gap-2 animate-pulse"
           onClick={() => router.push('/quiz/join')}
@@ -671,12 +727,12 @@ export default function StudentDashboard() {
               </thead>
               <tbody>
                 {quizHistory.length > 0 ? (
-                  quizHistory.map((quiz, idx) => (
+                  quizHistory.map((quiz: any, idx: number) => (
                     <tr key={idx} className="border-b hover:bg-gray-50">
                       <td className="py-3 px-4 font-medium">{quiz.title || quiz.quiz_id}</td>
-                      <td className="py-3 px-4">{quiz.score}%</td>
+                      <td className="py-3 px-4">{quiz.correct_answers}</td>
                       <td className="py-3 px-4">{Math.round((quiz.correct_answers / quiz.total_questions) * 100)}%</td>
-                      <td className="py-3 px-4">{Math.floor(quiz.time_spent / 60)}m {quiz.time_spent % 60}s</td>
+                      <td className="py-3 px-4">{formatTime(quiz.time_spent)}</td>
                       <td className="py-3 px-4">{quiz.taken_at ? new Date(quiz.taken_at).toLocaleString() : ''}</td>
                     </tr>
                   ))
@@ -687,16 +743,16 @@ export default function StudentDashboard() {
                 )}
               </tbody>
             </table>
-          </div>
-        </CardContent>
-      </Card>
+              </div>
+            </CardContent>
+          </Card>
     </div>
   )
 
   // Replace renderClassmates with renderDownloadQuestions
-  const renderDownloadQuestions = (downloading, setDownloading) => {
+  const renderDownloadQuestions = (downloading: string | null, setDownloading: (id: string | null) => void) => {
     console.log('Full quizHistory:', quizHistory);
-    const handleDownload = async (quiz) => {
+    const handleDownload = async (quiz: any) => {
       const quizId = quiz.quiz_id || quiz.id;
       console.log('Attempting to fetch quiz with id:', quizId, 'from quiz object:', quiz);
       if (!quizId) {
@@ -723,7 +779,7 @@ export default function StudentDashboard() {
         doc.text(quiz.title || quizData.title || quizId || 'Quiz', 10, 15);
         doc.setFontSize(12);
         let y = 30;
-        questions.forEach((q, idx) => {
+        questions.forEach((q: any, idx: number) => {
           doc.text(`${idx + 1}. ${q.question}`, 10, y);
           y += 8;
           // Get student's answer
@@ -774,16 +830,16 @@ export default function StudentDashboard() {
     };
 
     return (
-      <div className="space-y-6">
-        <div>
+    <div className="space-y-6">
+      <div>
           <h1 className="text-2xl font-bold text-gray-900">Download Questions</h1>
           <p className="text-gray-600">Download your quiz questions and answers as PDF</p>
-        </div>
+      </div>
         <div className="space-y-4">
           {quizHistory.length === 0 ? (
             <div className="text-gray-500">No quiz history available.</div>
           ) : (
-            quizHistory.map((quiz, idx) => (
+            quizHistory.map((quiz: any, idx: number) => (
               <div key={idx} className="flex items-center justify-between p-4 bg-white rounded shadow">
                 <div className="font-medium">{quiz.title || quiz.quiz_id}</div>
                 <button
@@ -793,90 +849,95 @@ export default function StudentDashboard() {
                 >
                   {downloading === (quiz.quiz_id || quiz.id) ? 'Downloading...' : 'Download PDF'}
                 </button>
-              </div>
+                  </div>
             ))
           )}
-        </div>
-      </div>
+                    </div>
+                  </div>
     );
   };
 
   const renderLeaderboard = () => {
+    console.log("renderLeaderboard called");
     let leaderboardData = [];
-    if (activeLeaderboard === "College Level") leaderboardData = collegeStudents;
-    else if (activeLeaderboard === "Department Level") leaderboardData = classStudents;
+    if (leaderboardScope === "College") leaderboardData = collegeStudents;
+    else if (leaderboardScope === "Department") leaderboardData = classStudents;
     else leaderboardData = sectionStudents;
-    console.log('Rendering leaderboardData:', leaderboardData);
     return (
-      <div className="space-y-6">
-        <div className="flex items-center justify-between">
-          <div>
-            <h1 className="text-2xl font-bold text-gray-900">Leaderboard</h1>
-            <p className="text-gray-600">See how you rank against peers</p>
-          </div>
-          <div className="flex items-center gap-2 text-sm text-gray-600">
-            <div className="w-2 h-2 bg-red-500 rounded-full animate-pulse" />
-            Live • Updates every 30 seconds
-          </div>
-        </div>
-        {/* Tabs for leaderboard level */}
-        <div className="flex gap-2 mb-4">
-          {["College Level", "Department Level", "Section Level"].map((level) => (
-            <Button
-              key={level}
-              variant={activeLeaderboard === level ? "default" : "outline"}
-              onClick={() => setActiveLeaderboard(level)}
-              className={activeLeaderboard === level ? "bg-blue-600" : ""}
-            >
-              {level}
-            </Button>
-          ))}
-        </div>
-        <Card>
-          <CardHeader>
-            <CardTitle>Rankings</CardTitle>
-            <CardDescription>Current standings based on quiz performance</CardDescription>
-          </CardHeader>
-          <CardContent>
-            <div className="space-y-3">
-              {leaderboardData.map((studentRow, index) => (
-                <div
-                  key={studentRow.id}
-                  className={`flex items-center justify-between p-4 rounded-lg ${
-                    studentRow.id === student?.id ? "bg-blue-50 border-l-4 border-blue-500" : "bg-gray-50"
-                  }`}
-                >
-                  <div className="flex items-center gap-4">
-                    <div
-                      className={`w-8 h-8 rounded-full flex items-center justify-center font-bold text-sm ${
-                        index < 3 ? "bg-yellow-500 text-white" : "bg-gray-200 text-gray-700"
-                      }`}
-                    >
-                      {index < 3 ? <Trophy className="w-4 h-4" /> : index + 1}
-                    </div>
-                    <div>
-                      <div className="flex items-center gap-2">
-                        <span className="font-medium">{studentRow.name}</span>
-                        {index < 3 && <Star className="w-4 h-4 text-yellow-500" />}
-                      </div>
-                      <div className="text-sm text-gray-600">
-                        {studentRow.department} • {studentRow.section}
-                      </div>
-                    </div>
+  <div className="space-y-6">
+    <div className="flex items-center justify-between">
+      <div>
+        <h1 className="text-2xl font-bold text-gray-900">Leaderboard</h1>
+        <p className="text-gray-600">See how you rank against peers</p>
+      </div>
+      <div className="flex items-center gap-2 text-sm text-gray-600">
+        <div className="w-2 h-2 bg-red-500 rounded-full animate-pulse" />
+        Live • Updates every 30 seconds
+      </div>
+    </div>
+    {/* Leaderboard Scope Selector */}
+    <div className="flex gap-2 mb-4">
+      {leaderboardScopes.map((scope) => (
+        <button
+          key={scope.value}
+          className={`px-4 py-2 rounded ${
+            leaderboardScope === scope.value ? "bg-blue-500 text-white" : "bg-gray-200"
+          }`}
+          onClick={() => setLeaderboardScope(scope.value)}
+        >
+          {scope.label} Level
+        </button>
+      ))}
+    </div>
+    <Card>
+      <CardHeader>
+        <CardTitle>Rankings</CardTitle>
+        <CardDescription>Current standings based on quiz performance</CardDescription>
+      </CardHeader>
+      <CardContent>
+        <div className="space-y-3">
+          {leaderboardData.length === 0 ? (
+            <div className="text-center text-gray-400 py-8">No students found for this leaderboard.</div>
+          ) : (
+            leaderboardData.map((studentRow, index) => (
+              <div
+                key={studentRow.id}
+                className={`flex items-center justify-between p-4 rounded-lg ${
+                  studentRow.id === user.id ? "bg-blue-50 border-l-4 border-blue-500" : "bg-gray-50"
+                }`}
+              >
+                <div className="flex items-center gap-4">
+                  <div
+                    className={`w-8 h-8 rounded-full flex items-center justify-center font-bold text-sm ${
+                      index < 3 ? "bg-yellow-500 text-white" : "bg-gray-200 text-gray-700"
+                    }`}
+                  >
+                    {index < 3 ? <Trophy className="w-4 h-4" /> : index + 1}
                   </div>
-                  <div className="text-right">
-                    <div className="font-bold text-lg">{studentRow.avg_score ?? 0}%</div>
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <span className="font-medium">{studentRow.full_name}</span>
+                      {index < 3 && <Star className="w-4 h-4 text-yellow-500" />}
+                    </div>
                     <div className="text-sm text-gray-600">
-                      {studentRow.quizzes_taken} quizzes
+                      {studentRow.department} • {studentRow.section}
                     </div>
                   </div>
                 </div>
-              ))}
-            </div>
-          </CardContent>
-        </Card>
-      </div>
-    );
+                <div className="text-right">
+                  <div className="font-bold text-lg">{studentRow.avg_score ?? 0}%</div>
+                  <div className="text-sm text-gray-600">
+                    {studentRow.quizzes_taken} quizzes
+                  </div>
+                </div>
+              </div>
+            ))
+          )}
+        </div>
+      </CardContent>
+    </Card>
+  </div>
+);
   };
 
   const renderSettings = () => (

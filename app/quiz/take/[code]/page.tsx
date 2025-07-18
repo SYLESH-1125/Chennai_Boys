@@ -32,6 +32,16 @@ interface Quiz {
   questions: Question[]
 }
 
+// Helper to shuffle an array
+function shuffleArray(array: any[]) {
+  const arr = [...array];
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
 export default function TakeQuizPage() {
   const params = useParams();
   const router = useRouter();
@@ -44,6 +54,7 @@ export default function TakeQuizPage() {
   const [error, setError] = useState("");
   const [showResult, setShowResult] = useState(false);
   const [resultData, setResultData] = useState<any>(null);
+  const [startTime, setStartTime] = useState<number | null>(null);
 
   const quizCode = params.code as string;
 
@@ -60,13 +71,41 @@ export default function TakeQuizPage() {
         .eq("code", quizCode)
         .single();
       if (data) {
-        setQuiz(data);
         setTimeLeft(data.timeLimit || 1800);
+        // Shuffle questions per user/attempt
+        const localStorageKey = `quiz_shuffled_${quizCode}_${user.id}`;
+        let shuffledQuestions = null;
+        let stored = localStorage.getItem(localStorageKey);
+        if (stored) {
+          shuffledQuestions = JSON.parse(stored);
+        } else {
+          shuffledQuestions = shuffleArray(data.questions);
+          localStorage.setItem(localStorageKey, JSON.stringify(shuffledQuestions));
+        }
+        setQuiz({ ...data, questions: shuffledQuestions });
+        // Persist startTime in localStorage per quiz attempt
+        const startTimeKey = `quiz_startTime_${quizCode}_${user.id}`;
+        let storedStartTime = localStorage.getItem(startTimeKey);
+        let startTimeValue = Date.now();
+        if (storedStartTime) {
+          startTimeValue = parseInt(storedStartTime, 10);
+        } else {
+          localStorage.setItem(startTimeKey, String(startTimeValue));
+        }
+        setStartTime(startTimeValue);
       } else {
         setError("Quiz not found");
       }
     };
     if (quizCode) fetchQuiz();
+    // Cleanup startTime from localStorage on unmount or quiz submit
+    return () => {
+      if (user && quizCode) {
+        const startTimeKey = `quiz_startTime_${quizCode}_${user.id}`;
+        localStorage.removeItem(startTimeKey);
+        // Do NOT remove shuffledKey here; only remove after submit
+      }
+    };
   }, [user, loading, quizCode, router]);
 
   useEffect(() => {
@@ -108,7 +147,10 @@ export default function TakeQuizPage() {
         totalPoints += question.points;
         const userAnswer = answers[question.id];
         let isCorrect = false;
-        if (question.type === "multiple-choice" || question.type === "true-false") {
+        if (question.type === "multiple-choice") {
+          const correctOption = question.options[question.correctAnswer];
+          isCorrect = String(userAnswer).trim().toLowerCase() === String(correctOption).trim().toLowerCase();
+        } else if (question.type === "true-false") {
           isCorrect = String(userAnswer).toLowerCase() === String(question.correctAnswer).toLowerCase();
         } else if (question.type === "short-answer" || question.type === "fill-in-the-blanks") {
           isCorrect = String(userAnswer).trim().toLowerCase() === String(question.correctAnswer).trim().toLowerCase();
@@ -118,14 +160,27 @@ export default function TakeQuizPage() {
           earnedPoints += question.points;
         }
       });
-      const score = earnedPoints;
-      const timeSpent = quiz.timelimit - timeLeft;
-
+      // Calculate score as percent
+      const scorePercent = totalPoints > 0 ? Math.round((earnedPoints / totalPoints) * 100) : 0;
+      // Calculate time spent as positive seconds
+      let timeSpent = 0;
+      const localStorageKey = `quiz_startTime_${quizCode}_${user.id}`;
+      let storedStartTime = localStorage.getItem(localStorageKey);
+      let startTimeValue = startTime;
+      if (storedStartTime) {
+        startTimeValue = parseInt(storedStartTime, 10);
+      }
+      if (startTimeValue) {
+        timeSpent = Math.max(0, Math.floor((Date.now() - startTimeValue) / 1000));
+      } else {
+        timeSpent = quiz.timeLimit ? quiz.timeLimit - timeLeft : 0;
+        if (timeSpent < 0) timeSpent = 0;
+      }
       // Save result to Supabase with all columns
       const result = {
         student_id: user.id,
         quiz_id: quiz.id,
-        score,
+        score: scorePercent, // store percent
         attempts: 1,
         status: "completed",
         taken_at: new Date().toISOString(),
@@ -143,18 +198,23 @@ export default function TakeQuizPage() {
       }
       // Update student's quiz_history with titles
       await updateStudentQuizHistory(user.id);
-      setResultData({ correctAnswers, totalQuestions: quiz.questions.length, score });
+      setResultData({ correctAnswers, totalQuestions: quiz.questions.length, score: scorePercent });
       setShowResult(true);
-    } catch (error) {
+      // Cleanup startTime and shuffled questions from localStorage after submit
+      const startTimeKey = `quiz_startTime_${quizCode}_${user.id}`;
+      const shuffledKey = `quiz_shuffled_${quizCode}_${user.id}`;
+      localStorage.removeItem(startTimeKey);
+      localStorage.removeItem(shuffledKey);
+    } catch (e) {
       setError("Failed to submit quiz. Please try again.");
       setIsSubmitting(false);
     }
   }
 
   const formatTime = (seconds: number) => {
-    const minutes = Math.floor(seconds / 60)
-    const remainingSeconds = seconds % 60
-    return `${minutes}:${remainingSeconds.toString().padStart(2, "0")}`
+    const minutes = Math.floor(seconds / 60);
+    const remainingSeconds = seconds % 60;
+    return `${minutes}m ${remainingSeconds}s`;
   }
 
   const getTimeColor = () => {
@@ -209,7 +269,7 @@ export default function TakeQuizPage() {
             <CardTitle className="text-green-900">Quiz Completed!</CardTitle>
             <CardDescription>
               You answered <span className="font-bold">{resultData.correctAnswers}</span> out of <span className="font-bold">{resultData.totalQuestions}</span> questions correctly.<br />
-              Your Score: <span className="font-bold">{resultData.score}</span>
+              Your Score: <span className="font-bold">{resultData.score}%</span>
             </CardDescription>
           </CardHeader>
           <CardContent>
