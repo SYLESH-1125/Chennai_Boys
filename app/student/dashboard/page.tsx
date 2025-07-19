@@ -163,6 +163,11 @@ export default function StudentDashboard() {
       .select('id, full_name, department, section, avg_score, quizzes_taken');
     console.log('All students:', all);
     setAllStudents(all || []);
+    
+    // Debug: Check all unique sections in the database
+    const uniqueSections = [...new Set(all?.map(s => s.section) || [])];
+    console.log('All unique sections in database:', uniqueSections);
+    
     // College Level: all students, sorted by avg_score
     const { data: college, error: collegeError } = await supabase
       .from('students')
@@ -170,6 +175,7 @@ export default function StudentDashboard() {
       .order('avg_score', { ascending: false });
     console.log('College fetch:', college, 'Error:', collegeError);
     setCollegeStudents(college || []);
+    
     // Department Level: students in same department, sorted by avg_score
     if (studentProfile && studentProfile.department) {
       const { data: dept, error: deptError } = await supabase
@@ -179,15 +185,36 @@ export default function StudentDashboard() {
         .order('avg_score', { ascending: false });
       console.log('Department fetch:', dept, 'Error:', deptError, 'Filter:', studentProfile.department);
       setClassStudents(dept || []);
+      
       // Section Level: students in same department and section, sorted by avg_score
       if (studentProfile.section) {
-        const { data: sect, error: sectError } = await supabase
+        console.log('Current user section:', studentProfile.section);
+        console.log('Current user department:', studentProfile.department);
+        
+        // Try exact match first
+        let { data: sect, error: sectError } = await supabase
           .from('students')
           .select('id, full_name, department, section, avg_score, quizzes_taken')
           .eq('department', studentProfile.department)
           .eq('section', studentProfile.section)
           .order('avg_score', { ascending: false });
-        console.log('Section fetch:', sect, 'Error:', sectError, 'Filter:', studentProfile.department, studentProfile.section);
+        
+        // If no results, try case-insensitive match
+        if (!sect || sect.length === 0) {
+          console.log('No exact match found, trying case-insensitive search...');
+          const { data: sectCaseInsensitive, error: sectCaseError } = await supabase
+            .from('students')
+            .select('id, full_name, department, section, avg_score, quizzes_taken')
+            .eq('department', studentProfile.department)
+            .ilike('section', studentProfile.section)
+            .order('avg_score', { ascending: false });
+          
+          sect = sectCaseInsensitive;
+          sectError = sectCaseError;
+          console.log('Case-insensitive section fetch:', sect, 'Error:', sectError);
+        }
+        
+        console.log('Final section fetch:', sect, 'Error:', sectError, 'Filter:', studentProfile.department, studentProfile.section);
         setSectionStudents(sect || []);
       }
     }
@@ -586,9 +613,9 @@ export default function StudentDashboard() {
         <Card className="bg-gradient-to-br from-white to-blue-50 shadow-lg border border-blue-100">
           <CardContent className="p-10 flex flex-col md:flex-row items-center gap-8">
             <div className="flex-1">
-              <h2 className="text-2xl font-bold mb-3">About the Quiz Portal</h2>
+              <h2 className="text-2xl font-bold mb-3">About the Dynamite Quiz</h2>
               <p className="text-gray-700 mb-5">
-                Welcome to the Quiz Portal! Here you can join quizzes, track your progress, and compete with classmates. Your dashboard gives you a real-time overview of your quiz activity and performance.
+                Welcome to the Dynamite Quiz! Here you can join quizzes, track your progress, and compete with classmates. Your dashboard gives you a real-time overview of your quiz activity and performance.
               </p>
               <h3 className="text-lg font-semibold mb-2">Tips for Success:</h3>
               <ul className="list-disc list-inside text-gray-600 space-y-1">
@@ -1036,7 +1063,7 @@ export default function StudentDashboard() {
               <BookOpen className="w-6 h-6 text-white" />
             </div>
             <div>
-              <h2 className="font-bold text-gray-900">Quiz Portal</h2>
+              <h2 className="font-bold text-gray-900">Dynamite Quiz</h2>
               <p className="text-sm text-gray-600">Student Panel</p>
             </div>
           </div>

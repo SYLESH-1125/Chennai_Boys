@@ -8,7 +8,7 @@ import { Providers } from "./providers"
 const inter = Inter({ subsets: ["latin"] })
 
 export const metadata: Metadata = {
-  title: "Quiz Portal - Student & Faculty Dashboard",
+  title: "Dynamite Quiz - Student & Faculty Dashboard",
   description: "A comprehensive quiz management platform for students and faculty",
   generator: 'v0.dev'
 }
