@@ -49,6 +49,13 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
+import {
   BookOpen,
   Users,
   BarChart3,
@@ -74,10 +81,13 @@ import {
   X,
   Flame,
   Filter,
+  Clock,
+  Minus,
 } from "lucide-react"
 import { useRouter } from "next/navigation"
 import { Line, Radar, Pie } from "./_chartDynamic"
 import { useAuth } from "@/contexts/auth-context"
+import { generateAnalyticsExportPDF, generatePerformanceReportPDF } from "@/lib/analytics-pdf-generator"
 
 // Navigation items
 const facultyNavItems = [
@@ -99,6 +109,14 @@ export default function FacultyDashboard() {
   const [quizzesLoading, setQuizzesLoading] = useState(true);
   const [quizResults, setQuizResults] = useState<any[]>([]);
   const [resultsLoading, setResultsLoading] = useState(true);
+  
+  // Modal states for quiz actions
+  const [viewQuizModal, setViewQuizModal] = useState<{ isOpen: boolean; quiz: any }>({ isOpen: false, quiz: null });
+  const [analyticsModal, setAnalyticsModal] = useState<{ isOpen: boolean; quiz: any }>({ isOpen: false, quiz: null });
+  const [copyingQuiz, setCopyingQuiz] = useState<string | null>(null);
+  
+  // Student names mapping (studentid -> student name)
+  const [studentNames, setStudentNames] = useState<Record<string, string>>({});
 
   // Fetch quizzes from Supabase when user is loaded
   useEffect(() => {
@@ -172,12 +190,67 @@ export default function FacultyDashboard() {
     };
   }, [user]);
 
+  // Fetch student names for quiz results
+  useEffect(() => {
+    const fetchStudentNames = async () => {
+      if (!quizResults || quizResults.length === 0) return;
+      
+      // Get unique student IDs
+      const studentIds = [...new Set(quizResults.map(r => r.studentid))];
+      
+      try {
+        const { supabase } = await import("@/lib/supabase");
+        
+        // Try to fetch from students table first
+        const { data: studentsData } = await supabase
+          .from("students")
+          .select("id, name")
+          .in("id", studentIds);
+
+        // Create name mapping from students table
+        const namesFromStudents: Record<string, string> = {};
+        if (studentsData) {
+          studentsData.forEach(student => {
+            namesFromStudents[student.id] = student.name;
+          });
+        }
+
+        // For any missing names, try to get from auth.users
+        const missingIds = studentIds.filter(id => !namesFromStudents[id]);
+        if (missingIds.length > 0) {
+          // Note: Direct auth.users query might not work due to RLS, 
+          // so we'll use a fallback format
+          missingIds.forEach(id => {
+            if (!namesFromStudents[id]) {
+              // Create a readable name from student ID
+              namesFromStudents[id] = `Student ${id.substring(0, 8)}`;
+            }
+          });
+        }
+
+        setStudentNames(namesFromStudents);
+      } catch (error) {
+        console.error('Error fetching student names:', error);
+        // Fallback: create readable names from student IDs
+        const fallbackNames: Record<string, string> = {};
+        studentIds.forEach(id => {
+          fallbackNames[id] = `Student ${id.substring(0, 8)}`;
+        });
+        setStudentNames(fallbackNames);
+      }
+    };
+
+    fetchStudentNames();
+  }, [quizResults]);
+
   // Aggregate stats for dashboard, quiz studio, analytics
   const analytics = useMemo(() => {
     if (!quizResults || quizResults.length === 0) return {
+      totalQuizzes: quizzes?.length || 0,
       totalSubmissions: 0,
       avgScore: 0,
       completionRate: 0,
+      activeStudents: 0,
       recentActivities: [],
       quizStats: {},
     };
@@ -185,6 +258,8 @@ export default function FacultyDashboard() {
     const avgScore = Math.round(
       quizResults.reduce((sum, r) => sum + (r.score || 0), 0) / (quizResults.length || 1)
     );
+    // Calculate active students (unique students who have submitted quizzes)
+    const activeStudents = new Set(quizResults.map(r => r.studentid)).size;
     // Completion rate: percent of quizzes with at least one submission
     const quizCodes = Array.from(new Set(quizResults.map(r => r.quizcode)));
     const completionRate = Math.round(
@@ -196,7 +271,7 @@ export default function FacultyDashboard() {
       .slice(0, 10)
       .map(r => ({
         type: "submission",
-        student: r.studentid,
+        student: studentNames[r.studentid] || `Student ${r.studentid.substring(0, 8)}`,
         quiz: r.quizcode,
         score: r.score,
         time: new Date(r.submittedat).toLocaleString(),
@@ -217,7 +292,129 @@ export default function FacultyDashboard() {
         weakAreas,
       };
     });
-    return { totalSubmissions, avgScore, completionRate, recentActivities, quizStats };
+    return { 
+      totalQuizzes: quizzes.length,
+      totalSubmissions, 
+      avgScore, 
+      completionRate, 
+      activeStudents, 
+      recentActivities, 
+      quizStats 
+    };
+  }, [quizResults, quizzes, studentNames]);
+
+  // Generate AI Teaching Assistant Insights
+  const aiInsights = useMemo(() => {
+    if (!quizResults || !quizzes || quizResults.length === 0) {
+      return {
+        performanceTrend: { text: "Collecting data...", subtitle: "Please wait for analysis" },
+        engagementAlert: { text: "Initializing insights...", subtitle: "Loading student data" },
+        recommendation: { text: "Preparing recommendations...", subtitle: "Based on current data" }
+      };
+    }
+
+    // Calculate performance trends
+    const recentResults = quizResults.filter(result => {
+      const submissionDate = new Date(result.submittedat);
+      const thirtyDaysAgo = new Date();
+      thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+      return submissionDate >= thirtyDaysAgo;
+    });
+
+    // Performance trend analysis
+    const totalQuizzes = quizzes.length;
+    const averageScore = recentResults.length > 0 
+      ? (recentResults.reduce((sum, result) => sum + (result.score || 0), 0) / recentResults.length).toFixed(1)
+      : 0;
+
+    let performanceTrend;
+    const avgScoreNum = Number(averageScore);
+    if (avgScoreNum >= 80) {
+      performanceTrend = {
+        text: `Excellent performance with ${averageScore}% average`,
+        subtitle: "Students are excelling across subjects"
+      };
+    } else if (avgScoreNum >= 65) {
+      performanceTrend = {
+        text: `Good progress with ${averageScore}% average`,
+        subtitle: "Steady improvement in quiz scores"
+      };
+    } else if (avgScoreNum >= 50) {
+      performanceTrend = {
+        text: `Average performance at ${averageScore}%`,
+        subtitle: "Room for improvement identified"
+      };
+    } else {
+      performanceTrend = {
+        text: `Performance needs attention (${averageScore}%)`,
+        subtitle: "Consider additional support strategies"
+      };
+    }
+
+    // Engagement alert analysis
+    const lowPerformingCount = recentResults.filter(result => (result.score || 0) < 60).length;
+    const uniqueStudents = new Set(recentResults.map(r => r.studentid)).size;
+    const totalUniqueStudents = new Set(quizResults.map(r => r.studentid)).size;
+    const participationRate = totalUniqueStudents > 0 ? ((uniqueStudents / totalUniqueStudents) * 100) : 0;
+
+    let engagementAlert;
+    if (lowPerformingCount > uniqueStudents * 0.3) {
+      engagementAlert = {
+        text: `${lowPerformingCount} students need support`,
+        subtitle: "in foundational concepts"
+      };
+    } else if (participationRate < 70) {
+      engagementAlert = {
+        text: `${(100 - participationRate).toFixed(0)}% students less active`,
+        subtitle: "Consider engagement strategies"
+      };
+    } else {
+      engagementAlert = {
+        text: `High engagement: ${participationRate.toFixed(0)}% active`,
+        subtitle: "Students are well-engaged"
+      };
+    }
+
+    // Recommendation based on data patterns
+    const subjects = [...new Set(quizzes.map(q => q.subject))];
+    const subjectPerformance = subjects.map(subject => {
+      const subjectQuizzes = quizzes.filter(q => q.subject === subject);
+      const subjectResults = recentResults.filter(result => 
+        subjectQuizzes.some(quiz => quiz.id === result.quizid)
+      );
+      const avgScore = subjectResults.length > 0 
+        ? subjectResults.reduce((sum, result) => sum + (result.score || 0), 0) / subjectResults.length
+        : 0;
+      return { subject, avgScore };
+    }).sort((a, b) => a.avgScore - b.avgScore);
+
+    let recommendation;
+    if (subjectPerformance.length > 0) {
+      const weakestSubject = subjectPerformance[0];
+      if (weakestSubject.avgScore < 60) {
+        recommendation = {
+          text: `Focus on ${weakestSubject.subject} concepts`,
+          subtitle: `Average score: ${weakestSubject.avgScore.toFixed(1)}%`
+        };
+      } else if (totalQuizzes < 5) {
+        recommendation = {
+          text: "Create more practice quizzes",
+          subtitle: "to build comprehensive assessment"
+        };
+      } else {
+        recommendation = {
+          text: "Consider advanced problem sets",
+          subtitle: "for high-performing students"
+        };
+      }
+    } else {
+      recommendation = {
+        text: "Start with diagnostic quizzes",
+        subtitle: "to assess baseline knowledge"
+      };
+    }
+
+    return { performanceTrend, engagementAlert, recommendation };
   }, [quizResults, quizzes]);
 
   useEffect(() => {
@@ -230,6 +427,68 @@ export default function FacultyDashboard() {
   const handleLogout = async () => {
     await signOut();
     router.push("/login");
+  };
+
+  // PDF Export Handlers
+  const handleExportAnalytics = () => {
+    try {
+      generateAnalyticsExportPDF(analytics, sectionAnalytics, studentsWithPerformance, quizResults);
+    } catch (error) {
+      console.error('Error generating analytics export:', error);
+      alert('Failed to generate analytics export. Please try again.');
+    }
+  };
+
+  const handleDownloadReport = () => {
+    try {
+      generatePerformanceReportPDF(analytics, sectionAnalytics, studentsWithPerformance, quizResults, quizzes);
+    } catch (error) {
+      console.error('Error generating performance report:', error);
+      alert('Failed to generate performance report. Please try again.');
+    }
+  };
+
+  // Quiz Action Handlers
+  const handleCopyQuiz = async (quiz: any) => {
+    if (copyingQuiz) return;
+    setCopyingQuiz(quiz.code);
+    
+    try {
+      const { supabase } = await import("@/lib/supabase");
+      
+      // Generate new quiz code
+      const newCode = Math.random().toString(36).substring(2, 8).toUpperCase();
+      
+      // Create copy of the quiz
+      const newQuiz = {
+        ...quiz,
+        id: undefined, // Let database generate new ID
+        code: newCode,
+        title: `${quiz.title} (Copy)`,
+        createdAt: new Date().toISOString(),
+        status: 'draft', // New copy starts as draft
+      };
+      
+      const { data, error } = await supabase
+        .from("quizzes")
+        .insert([newQuiz])
+        .select()
+        .single();
+        
+      if (error) {
+        throw error;
+      }
+      
+      // Add the new quiz to the local state
+      setQuizzes(prev => [data, ...prev]);
+      alert(`Quiz copied successfully! New quiz code: ${newCode}`);
+      
+    } catch (error) {
+      console.error('Error copying quiz:', error);
+      alert('Failed to copy quiz. Please try again.');
+    } finally {
+      setCopyingQuiz(null);
+    }
   };
 
   // Dashboard Content
@@ -253,7 +512,7 @@ export default function FacultyDashboard() {
           </div>
         </div>
         <div className="flex items-center gap-3">
-          <Button variant="outline" className="gap-2 bg-white/80 backdrop-blur-sm">
+          <Button variant="outline" className="gap-2 bg-white/80 backdrop-blur-sm" onClick={handleExportAnalytics}>
             <Download className="w-4 h-4" />
             Export Analytics
           </Button>
@@ -286,24 +545,24 @@ export default function FacultyDashboard() {
               <TrendingUp className="w-4 h-4 text-green-600" />
               <span className="text-sm font-medium text-gray-700">Performance Trend</span>
             </div>
-            <p className="text-sm text-gray-900 font-medium">Algorithm scores improved by 8.5%</p>
-            <p className="text-xs text-gray-600">after implementing visual explanations</p>
+            <p className="text-sm text-gray-900 font-medium">{aiInsights.performanceTrend.text}</p>
+            <p className="text-xs text-gray-600">{aiInsights.performanceTrend.subtitle}</p>
           </div>
           <div className="bg-white/60 backdrop-blur-sm rounded-lg p-4">
             <div className="flex items-center gap-2 mb-2">
               <AlertTriangle className="w-4 h-4 text-orange-600" />
               <span className="text-sm font-medium text-gray-700">Engagement Alert</span>
             </div>
-            <p className="text-sm text-gray-900 font-medium">15 students need additional support</p>
-            <p className="text-xs text-gray-600">in Data Structures concepts</p>
+            <p className="text-sm text-gray-900 font-medium">{aiInsights.engagementAlert.text}</p>
+            <p className="text-xs text-gray-600">{aiInsights.engagementAlert.subtitle}</p>
           </div>
           <div className="bg-white/60 backdrop-blur-sm rounded-lg p-4">
             <div className="flex items-center gap-2 mb-2">
               <Lightbulb className="w-4 h-4 text-blue-600" />
               <span className="text-sm font-medium text-gray-700">Recommendation</span>
             </div>
-            <p className="text-sm text-gray-900 font-medium">Consider adaptive difficulty</p>
-            <p className="text-xs text-gray-600">for next Database Systems quiz</p>
+            <p className="text-sm text-gray-900 font-medium">{aiInsights.recommendation.text}</p>
+            <p className="text-xs text-gray-600">{aiInsights.recommendation.subtitle}</p>
           </div>
         </CardContent>
       </Card>
@@ -334,7 +593,7 @@ export default function FacultyDashboard() {
             <div className="flex items-center justify-between">
               <div>
                 <p className="text-sm font-medium text-gray-600">Active Students</p>
-                <p className="text-3xl font-bold text-gray-900">342</p>
+                <p className="text-3xl font-bold text-gray-900">{analytics.activeStudents || 0}</p>
                 <div className="flex items-center gap-1 mt-1">
                   <TrendingUp className="w-4 h-4 text-green-600" />
                   <span className="text-sm text-green-600">+8.4%</span>
@@ -547,7 +806,7 @@ export default function FacultyDashboard() {
               Department Level
             </Button>
           </div>
-          <Button variant="outline" className="gap-2 bg-white/80 backdrop-blur-sm">
+          <Button variant="outline" className="gap-2 bg-white/80 backdrop-blur-sm" onClick={handleDownloadReport}>
             <Download className="w-4 h-4" />
             Download Report
           </Button>
@@ -617,20 +876,442 @@ export default function FacultyDashboard() {
         })}
       </div>
 
-      {/* Chart Placeholder */}
+      {/* Enhanced Section Performance Analytics */}
       <Card className="bg-white/80 backdrop-blur-sm border-0 shadow-lg">
         <CardHeader>
-          <CardTitle>Section Performance Trends</CardTitle>
-          <CardDescription>Performance comparison across sections over time</CardDescription>
+          <CardTitle className="flex items-center gap-2">
+            <TrendingUp className="w-5 h-5" />
+            Section Performance Trends
+          </CardTitle>
+          <CardDescription>Comprehensive performance analysis across sections</CardDescription>
         </CardHeader>
         <CardContent>
-          <div className="h-64 bg-gradient-to-br from-gray-50 to-gray-100 rounded-lg flex items-center justify-center">
-            <div className="text-center">
-              <BarChart3 className="w-12 h-12 text-gray-400 mx-auto mb-2" />
-              <p className="text-gray-600">Chart.js Integration Placeholder</p>
-              <p className="text-sm text-gray-500">Section performance trends will be displayed here</p>
+          {analyticsFilter === "Section Level" && (
+            <div className="space-y-6">
+              {/* Section Comparison Grid */}
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                {/* Real section data calculated from student and quiz results */}
+                {sectionAnalytics.sections.length > 0 ? sectionAnalytics.sections.map((sectionData) => (
+                  <div key={sectionData.section} className={`p-4 rounded-lg border-l-4 ${
+                    sectionData.color === 'green' ? 'border-green-500 bg-green-50' :
+                    sectionData.color === 'blue' ? 'border-blue-500 bg-blue-50' :
+                    sectionData.color === 'yellow' ? 'border-yellow-500 bg-yellow-50' :
+                    sectionData.color === 'purple' ? 'border-purple-500 bg-purple-50' :
+                    sectionData.color === 'indigo' ? 'border-indigo-500 bg-indigo-50' :
+                    sectionData.color === 'red' ? 'border-red-500 bg-red-50' :
+                    'border-orange-500 bg-orange-50'
+                  }`}>
+                    <div className="flex items-center justify-between mb-2">
+                      <h4 className="font-semibold text-gray-900">{sectionData.section}</h4>
+                      <div className={`flex items-center gap-1 ${
+                        sectionData.trend === 'up' ? 'text-green-600' :
+                        sectionData.trend === 'down' ? 'text-red-600' : 'text-gray-600'
+                      }`}>
+                        {sectionData.trend === 'up' && <TrendingUp className="w-4 h-4" />}
+                        {sectionData.trend === 'down' && <TrendingDown className="w-4 h-4" />}
+                        {sectionData.trend === 'stable' && <Minus className="w-4 h-4" />}
+                      </div>
+                    </div>
+                    <div className="space-y-2">
+                      <div className="flex justify-between text-sm">
+                        <span>Average Score</span>
+                        <span className="font-medium">{sectionData.avgScore}%</span>
+                      </div>
+                      <div className="flex justify-between text-sm">
+                        <span>Total Students</span>
+                        <span className="font-medium">{sectionData.students}</span>
+                      </div>
+                      <div className="flex justify-between text-sm">
+                        <span>Participation</span>
+                        <span className="font-medium">{sectionData.participation}%</span>
+                      </div>
+                      <div className="w-full bg-gray-200 rounded-full h-2">
+                        <div 
+                          className={`h-2 rounded-full ${
+                            sectionData.avgScore >= 75 ? 'bg-green-500' :
+                            sectionData.avgScore >= 65 ? 'bg-yellow-500' : 'bg-red-500'
+                          }`}
+                          style={{ width: `${sectionData.avgScore}%` }}
+                        ></div>
+                      </div>
+                    </div>
+                  </div>
+                )) : (
+                  <div className="col-span-full text-center py-8">
+                    <div className="text-gray-500">
+                      <BarChart3 className="w-12 h-12 mx-auto mb-3 opacity-50" />
+                      <p className="text-lg font-medium">No section data available</p>
+                      <p className="text-sm">Add students and quiz submissions to see section performance analytics</p>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Subject-wise Performance */}
+              <div className="bg-gradient-to-br from-blue-50 to-indigo-100 p-6 rounded-lg">
+                <h3 className="text-lg font-semibold text-gray-900 mb-4 flex items-center gap-2">
+                  <BookOpen className="w-5 h-5" />
+                  Subject-wise Performance Trends
+                </h3>
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+                  {sectionAnalytics.subjectTrends.length > 0 ? sectionAnalytics.subjectTrends.map((subject) => (
+                    <div key={subject.subject} className="bg-white p-4 rounded-lg shadow-sm">
+                      <h4 className="font-medium text-gray-900 mb-2">{subject.subject}</h4>
+                      <div className="flex items-center justify-between">
+                        <span className="text-2xl font-bold text-gray-900">{subject.score}%</span>
+                        <span className={`text-sm font-medium ${
+                          subject.trend.startsWith('+') ? 'text-green-600' : 
+                          subject.trend.startsWith('-') ? 'text-red-600' : 'text-gray-600'
+                        }`}>
+                          {subject.trend}
+                        </span>
+                      </div>
+                      <div className="mt-2 w-full bg-gray-200 rounded-full h-1.5">
+                        <div 
+                          className={`h-1.5 rounded-full ${
+                            subject.color === 'blue' ? 'bg-blue-500' :
+                            subject.color === 'purple' ? 'bg-purple-500' :
+                            subject.color === 'green' ? 'bg-green-500' : 
+                            subject.color === 'red' ? 'bg-red-500' : 'bg-indigo-500'
+                          }`}
+                          style={{ width: `${subject.score}%` }}
+                        ></div>
+                      </div>
+                    </div>
+                  )) : (
+                    <div className="col-span-full text-center py-6 text-gray-500">
+                      <BookOpen className="w-8 h-8 mx-auto mb-2 opacity-50" />
+                      <p>No subject performance data available</p>
+                      <p className="text-sm">Create quizzes with different subjects to see trends</p>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Engagement Analytics */}
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                <div className="bg-gradient-to-br from-green-50 to-emerald-100 p-6 rounded-lg">
+                  <h3 className="text-lg font-semibold text-gray-900 mb-4 flex items-center gap-2">
+                    <Users className="w-5 h-5" />
+                    Student Engagement Levels
+                  </h3>
+                  {sectionAnalytics.sections.length > 0 ? (
+                    <div className="space-y-3">
+                      {(() => {
+                        const highEngagement = sectionAnalytics.sections.filter(s => s.participation >= 80).length;
+                        const mediumEngagement = sectionAnalytics.sections.filter(s => s.participation >= 60 && s.participation < 80).length;
+                        const lowEngagement = sectionAnalytics.sections.filter(s => s.participation < 60).length;
+                        const total = sectionAnalytics.sections.length;
+                        
+                        return (
+                          <>
+                            <div className="flex items-center justify-between">
+                              <div className="flex items-center gap-2">
+                                <div className="w-3 h-3 bg-green-500 rounded-full"></div>
+                                <span className="text-sm">High Engagement (80%+)</span>
+                              </div>
+                              <span className="font-semibold">{Math.round((highEngagement / total) * 100)}%</span>
+                            </div>
+                            <div className="flex items-center justify-between">
+                              <div className="flex items-center gap-2">
+                                <div className="w-3 h-3 bg-yellow-500 rounded-full"></div>
+                                <span className="text-sm">Medium Engagement (60-79%)</span>
+                              </div>
+                              <span className="font-semibold">{Math.round((mediumEngagement / total) * 100)}%</span>
+                            </div>
+                            <div className="flex items-center justify-between">
+                              <div className="flex items-center gap-2">
+                                <div className="w-3 h-3 bg-red-500 rounded-full"></div>
+                                <span className="text-sm">Low Engagement (&lt;60%)</span>
+                              </div>
+                              <span className="font-semibold">{Math.round((lowEngagement / total) * 100)}%</span>
+                            </div>
+                          </>
+                        );
+                      })()}
+                    </div>
+                  ) : (
+                    <div className="text-center py-4 text-gray-500">
+                      <Users className="w-8 h-8 mx-auto mb-2 opacity-50" />
+                      <p className="text-sm">No engagement data available</p>
+                    </div>
+                  )}
+                </div>
+
+                <div className="bg-gradient-to-br from-purple-50 to-violet-100 p-6 rounded-lg">
+                  <h3 className="text-lg font-semibold text-gray-900 mb-4 flex items-center gap-2">
+                    <Clock className="w-5 h-5" />
+                    Activity Patterns
+                  </h3>
+                  {quizResults.length > 0 ? (
+                    <div className="space-y-3">
+                      {(() => {
+                        // Calculate activity patterns from real quiz results
+                        const completedQuizzes = quizResults.filter(r => r.score !== null);
+                        const avgSessionTime = completedQuizzes.length > 0 
+                          ? Math.round(completedQuizzes.reduce((sum, r) => sum + (r.time_spent || 0), 0) / completedQuizzes.length)
+                          : 0;
+                        
+                        const completionRate = quizResults.length > 0 
+                          ? Math.round((completedQuizzes.length / quizResults.length) * 100)
+                          : 0;
+                        
+                        // Group by hour for peak activity
+                        const hourCounts: Record<number, number> = {};
+                        quizResults.forEach(r => {
+                          if (r.submittedat) {
+                            const hour = new Date(r.submittedat).getHours();
+                            hourCounts[hour] = (hourCounts[hour] || 0) + 1;
+                          }
+                        });
+                        
+                        const peakHour = Object.entries(hourCounts)
+                          .sort((a, b) => b[1] - a[1])[0]?.[0];
+                        const peakHourDisplay = peakHour 
+                          ? `${peakHour}:00 - ${parseInt(peakHour) + 1}:00`
+                          : 'N/A';
+                        
+                        // Group by day for most active day
+                        const dayCounts: Record<string, number> = {};
+                        const dayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+                        quizResults.forEach(r => {
+                          if (r.submittedat) {
+                            const dayName = dayNames[new Date(r.submittedat).getDay()];
+                            dayCounts[dayName] = (dayCounts[dayName] || 0) + 1;
+                          }
+                        });
+                        
+                        const mostActiveDay = Object.entries(dayCounts)
+                          .sort((a, b) => b[1] - a[1])[0]?.[0] || 'N/A';
+                        
+                        return (
+                          <>
+                            <div className="flex justify-between">
+                              <span className="text-sm text-gray-600">Peak Quiz Hours</span>
+                              <span className="font-medium">{peakHourDisplay}</span>
+                            </div>
+                            <div className="flex justify-between">
+                              <span className="text-sm text-gray-600">Most Active Day</span>
+                              <span className="font-medium">{mostActiveDay}</span>
+                            </div>
+                            <div className="flex justify-between">
+                              <span className="text-sm text-gray-600">Average Session Time</span>
+                              <span className="font-medium">{Math.floor(avgSessionTime / 60)}m {avgSessionTime % 60}s</span>
+                            </div>
+                            <div className="flex justify-between">
+                              <span className="text-sm text-gray-600">Completion Rate</span>
+                              <span className={`font-medium ${completionRate >= 80 ? 'text-green-600' : completionRate >= 60 ? 'text-yellow-600' : 'text-red-600'}`}>
+                                {completionRate}%
+                              </span>
+                            </div>
+                          </>
+                        );
+                      })()}
+                    </div>
+                  ) : (
+                    <div className="text-center py-4 text-gray-500">
+                      <Clock className="w-8 h-8 mx-auto mb-2 opacity-50" />
+                      <p className="text-sm">No activity data available</p>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Performance Insights */}
+              <div className="bg-gradient-to-br from-amber-50 to-orange-100 p-6 rounded-lg">
+                <h3 className="text-lg font-semibold text-gray-900 mb-4 flex items-center gap-2">
+                  <Lightbulb className="w-5 h-5" />
+                  AI-Powered Insights & Recommendations
+                </h3>
+                {sectionAnalytics.sections.length > 0 ? (
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div className="bg-white p-4 rounded-lg">
+                      <h4 className="font-medium text-green-900 mb-2 flex items-center gap-2">
+                        <TrendingUp className="w-4 h-4" />
+                        Top Performing Sections
+                      </h4>
+                      <ul className="space-y-1 text-sm">
+                        {sectionAnalytics.sections
+                          .sort((a, b) => b.avgScore - a.avgScore)
+                          .slice(0, 3)
+                          .map((section, index) => (
+                            <li key={section.section}>
+                              • {section.section}: {section.avgScore}% avg ({section.trend === 'up' ? '↑' : section.trend === 'down' ? '↓' : '→'} {section.participation}% participation)
+                            </li>
+                          ))}
+                      </ul>
+                    </div>
+                    <div className="bg-white p-4 rounded-lg">
+                      <h4 className="font-medium text-red-900 mb-2 flex items-center gap-2">
+                        <AlertTriangle className="w-4 h-4" />
+                        Needs Attention
+                      </h4>
+                      <ul className="space-y-1 text-sm">
+                        {(() => {
+                          const needsAttention: string[] = [];
+                          
+                          // Low participation sections
+                          const lowParticipation = sectionAnalytics.sections.filter(s => s.participation < 70);
+                          lowParticipation.forEach(s => 
+                            needsAttention.push(`• ${s.section}: Low participation (${s.participation}%)`)
+                          );
+                          
+                          // Declining scores
+                          const declining = sectionAnalytics.sections.filter(s => s.trend === 'down');
+                          declining.forEach(s => 
+                            needsAttention.push(`• ${s.section}: Declining trend (${s.avgScore}% avg)`)
+                          );
+                          
+                          // Low average scores
+                          const lowScore = sectionAnalytics.sections.filter(s => s.avgScore < 65);
+                          lowScore.forEach(s => 
+                            needsAttention.push(`• ${s.section}: Needs score improvement (${s.avgScore}%)`)
+                          );
+                          
+                          return needsAttention.length > 0 
+                            ? needsAttention.slice(0, 3).map((item, index) => <li key={index}>{item}</li>)
+                            : [<li key="none">• All sections performing well!</li>];
+                        })()}
+                      </ul>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="text-center py-6 text-gray-500">
+                    <Lightbulb className="w-12 h-12 mx-auto mb-3 opacity-50" />
+                    <p className="font-medium">No insights available yet</p>
+                    <p className="text-sm">Add students and quiz results to generate AI-powered recommendations</p>
+                  </div>
+                )}
+              </div>
             </div>
-          </div>
+          )}
+
+          {analyticsFilter === "Department Level" && (
+            <div className="space-y-6">
+              {/* Department Comparison Grid */}
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+                {departmentAnalytics.departments.length > 0 ? departmentAnalytics.departments.map((dept) => (
+                  <div key={dept.department} className={`p-4 rounded-lg ${
+                    dept.color === 'blue' ? 'bg-blue-50 border border-blue-200' :
+                    dept.color === 'purple' ? 'bg-purple-50 border border-purple-200' :
+                    dept.color === 'green' ? 'bg-green-50 border border-green-200' :
+                    'bg-orange-50 border border-orange-200'
+                  }`}>
+                    <div className="flex items-center justify-between mb-2">
+                      <h4 className="font-semibold text-gray-900">{dept.department}</h4>
+                      <div className={`flex items-center gap-1 ${
+                        dept.trend === 'up' ? 'text-green-600' :
+                        dept.trend === 'down' ? 'text-red-600' : 'text-gray-600'
+                      }`}>
+                        {dept.trend === 'up' && <TrendingUp className="w-4 h-4" />}
+                        {dept.trend === 'down' && <TrendingDown className="w-4 h-4" />}
+                        {dept.trend === 'stable' && <Minus className="w-4 h-4" />}
+                      </div>
+                    </div>
+                    <div className="space-y-2">
+                      <div className="flex justify-between text-sm">
+                        <span>Average Score</span>
+                        <span className="font-medium">{dept.avgScore}%</span>
+                      </div>
+                      <div className="flex justify-between text-sm">
+                        <span>Total Students</span>
+                        <span className="font-medium">{dept.students}</span>
+                      </div>
+                      <div className="flex justify-between text-sm">
+                        <span>Participation</span>
+                        <span className="font-medium">{dept.participation}%</span>
+                      </div>
+                      <div className="flex justify-between text-sm">
+                        <span>Growth</span>
+                        <span className={`font-medium ${dept.growth.startsWith('+') ? 'text-green-600' : dept.growth.startsWith('-') ? 'text-red-600' : 'text-gray-600'}`}>
+                          {dept.growth}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                )) : (
+                  <div className="col-span-full text-center text-gray-500 py-8">
+                    <BarChart3 className="w-12 h-12 mx-auto mb-2" />
+                    <p>No department data available</p>
+                    <p className="text-sm">Students need to be enrolled and take quizzes for department analytics</p>
+                  </div>
+                )}
+              </div>
+              
+              {/* Department Performance Overview */}
+              {departmentAnalytics.departments.length > 0 && (
+                <Card>
+                  <CardHeader>
+                    <CardTitle className="flex items-center gap-2">
+                      <TrendingUp className="w-5 h-5" />
+                      Department Performance Overview
+                    </CardTitle>
+                  </CardHeader>
+                  <CardContent>
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                      <div>
+                        <h4 className="font-semibold mb-3">Top Performing Departments</h4>
+                        <div className="space-y-2">
+                          {departmentAnalytics.departments
+                            .slice(0, 3)
+                            .map((dept, index) => (
+                              <div key={dept.department} className="flex items-center justify-between p-2 rounded bg-gray-50">
+                                <div className="flex items-center gap-2">
+                                  <span className={`w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold ${
+                                    index === 0 ? 'bg-yellow-500 text-white' :
+                                    index === 1 ? 'bg-gray-400 text-white' :
+                                    'bg-orange-600 text-white'
+                                  }`}>
+                                    {index + 1}
+                                  </span>
+                                  <span className="font-medium">{dept.department}</span>
+                                </div>
+                                <span className="text-sm text-gray-600">{dept.avgScore}%</span>
+                              </div>
+                            ))}
+                        </div>
+                      </div>
+                      
+                      <div>
+                        <h4 className="font-semibold mb-3">Participation Leaders</h4>
+                        <div className="space-y-2">
+                          {departmentAnalytics.departments
+                            .sort((a, b) => b.participation - a.participation)
+                            .slice(0, 3)
+                            .map((dept) => (
+                              <div key={dept.department} className="flex justify-between p-2 rounded bg-gray-50">
+                                <span className="font-medium">{dept.department}</span>
+                                <span className="text-sm text-gray-600">{dept.participation}%</span>
+                              </div>
+                            ))}
+                        </div>
+                      </div>
+                      
+                      <div>
+                        <h4 className="font-semibold mb-3">Growth Trends</h4>
+                        <div className="space-y-2">
+                          {departmentAnalytics.departments
+                            .filter(d => d.trend !== 'stable')
+                            .sort((a, b) => (b.growth.startsWith('+') ? 1 : -1) - (a.growth.startsWith('+') ? 1 : -1))
+                            .slice(0, 3)
+                            .map((dept) => (
+                              <div key={dept.department} className="flex justify-between p-2 rounded bg-gray-50">
+                                <span className="font-medium">{dept.department}</span>
+                                <span className={`text-sm font-medium ${
+                                  dept.growth.startsWith('+') ? 'text-green-600' : 'text-red-600'
+                                }`}>
+                                  {dept.growth}
+                                </span>
+                              </div>
+                            ))}
+                        </div>
+                      </div>
+                    </div>
+                  </CardContent>
+                </Card>
+              )}
+            </div>
+          )}
         </CardContent>
       </Card>
     </div>
@@ -729,17 +1410,42 @@ export default function FacultyDashboard() {
                     </Badge>
                   </div>
                   <div className="flex items-center gap-2">
-                    <Button variant="ghost" size="sm">
+                    <Button 
+                      variant="ghost" 
+                      size="sm" 
+                      onClick={() => setViewQuizModal({ isOpen: true, quiz })}
+                      title="View Quiz"
+                    >
                       <Eye className="w-4 h-4" />
                     </Button>
-                    <Button variant="ghost" size="sm">
+                    <Button 
+                      variant="ghost" 
+                      size="sm"
+                      onClick={() => router.push(`/faculty/quiz/create?edit=${quiz.code}`)}
+                      title="Edit Quiz"
+                    >
                       <Edit className="w-4 h-4" />
                     </Button>
-                    <Button variant="ghost" size="sm">
+                    <Button 
+                      variant="ghost" 
+                      size="sm"
+                      onClick={() => setAnalyticsModal({ isOpen: true, quiz })}
+                      title="Quiz Analytics"
+                    >
                       <BarChart3 className="w-4 h-4" />
                     </Button>
-                    <Button variant="ghost" size="sm">
-                      <Copy className="w-4 h-4" />
+                    <Button 
+                      variant="ghost" 
+                      size="sm"
+                      onClick={() => handleCopyQuiz(quiz)}
+                      disabled={copyingQuiz === quiz.code}
+                      title="Copy Quiz"
+                    >
+                      {copyingQuiz === quiz.code ? (
+                        <div className="w-4 h-4 border-2 border-gray-300 border-t-gray-600 rounded-full animate-spin" />
+                      ) : (
+                        <Copy className="w-4 h-4" />
+                      )}
                     </Button>
                   </div>
                 </div>
@@ -776,6 +1482,54 @@ export default function FacultyDashboard() {
   // Student Hub Content (fetch all students from students table)
   const [allStudents, setAllStudents] = useState<any[]>([]);
   const [studentsLoading, setStudentsLoading] = useState(true);
+
+  // Calculate real-time student performance based on quiz results
+  const studentsWithPerformance = useMemo(() => {
+    if (!allStudents || !quizResults) return [];
+    
+    return allStudents.map((student) => {
+      // Get quiz results for this student from faculty's quizzes
+      const studentResults = quizResults.filter(result => result.studentid === student.id);
+      
+      if (studentResults.length === 0) {
+        return {
+          ...student,
+          calculatedAvgScore: 0,
+          calculatedAccuracy: 0,
+          totalQuizzesTaken: 0,
+          hasQuizData: false
+        };
+      }
+
+      // Calculate average score
+      const avgScore = Math.round(
+        studentResults.reduce((sum, result) => sum + (result.score || 0), 0) / studentResults.length
+      );
+
+      // Calculate accuracy percentage
+      // Accuracy = (Correct answers / Total questions attempted) * 100
+      // For now, we'll use score as a proxy for accuracy since we don't have detailed question-level data
+      // In a real scenario, you'd have correct_answers and total_questions fields
+      const accuracy = Math.round(
+        studentResults.reduce((sum, result) => {
+          // Assuming score represents percentage of correct answers
+          return sum + (result.score || 0);
+        }, 0) / studentResults.length
+      );
+
+      return {
+        ...student,
+        calculatedAvgScore: avgScore,
+        calculatedAccuracy: accuracy,
+        totalQuizzesTaken: studentResults.length,
+        hasQuizData: true,
+        latestQuizDate: studentResults.length > 0 
+          ? new Date(Math.max(...studentResults.map(r => new Date(r.submittedat).getTime())))
+          : null
+      };
+    }).filter(student => student.hasQuizData); // Only show students who have taken quizzes
+  }, [allStudents, quizResults]);
+
   useEffect(() => {
     async function fetchAllStudents() {
       setStudentsLoading(true);
@@ -810,6 +1564,236 @@ export default function FacultyDashboard() {
     };
   })();
 
+  // Section Performance Analytics (using real data from quizResults and studentsWithPerformance)
+  const sectionAnalytics = useMemo(() => {
+    if (!studentsWithPerformance || studentsWithPerformance.length === 0 || !quizResults || quizResults.length === 0) {
+      return {
+        sections: [],
+        subjectTrends: [],
+        insights: ["No data available for section analytics"],
+        totalSections: 0,
+        avgParticipation: 0,
+        topPerformer: null
+      };
+    }
+
+    // Group students by section and department to create section identifiers
+    const sectionGroups = studentsWithPerformance.reduce((acc: Record<string, any[]>, student: any) => {
+      const sectionKey = `${student.department}-${student.section}`;
+      if (!acc[sectionKey]) {
+        acc[sectionKey] = [];
+      }
+      acc[sectionKey].push(student);
+      return acc;
+    }, {} as Record<string, any[]>);
+
+    // Calculate section performance data
+    const sectionData = Object.entries(sectionGroups)
+      .map(([sectionKey, students]: [string, any[]]) => {
+        const avgScore = students.reduce((sum: number, s: any) => sum + (s.calculatedAvgScore || 0), 0) / students.length;
+        const avgAccuracy = students.reduce((sum: number, s: any) => sum + (s.calculatedAccuracy || 0), 0) / students.length;
+        
+        // Calculate participation from quiz results
+        const sectionStudentIds = students.map((s: any) => s.id);
+        const sectionQuizResults = quizResults.filter((r: any) => sectionStudentIds.includes(r.studentid));
+        const participatingStudents = new Set(sectionQuizResults.map((r: any) => r.studentid)).size;
+        const participation = Math.round((participatingStudents / students.length) * 100);
+        
+        // Determine trend based on recent quiz results
+        const recentResults = sectionQuizResults
+          .sort((a: any, b: any) => new Date(b.submittedat).getTime() - new Date(a.submittedat).getTime())
+          .slice(0, 10);
+        
+        let trend = "stable";
+        let color = "blue";
+        
+        if (recentResults.length >= 2) {
+          const firstHalf = recentResults.slice(0, Math.floor(recentResults.length / 2));
+          const secondHalf = recentResults.slice(Math.floor(recentResults.length / 2));
+          
+          const firstAvg = firstHalf.reduce((sum: number, r: any) => sum + (r.score || 0), 0) / firstHalf.length;
+          const secondAvg = secondHalf.reduce((sum: number, r: any) => sum + (r.score || 0), 0) / secondHalf.length;
+          
+          if (firstAvg > secondAvg + 5) {
+            trend = "up";
+            color = "green";
+          } else if (secondAvg > firstAvg + 5) {
+            trend = "down";
+            color = "red";
+          }
+        }
+
+        // Assign colors based on performance
+        if (avgScore >= 80) color = "green";
+        else if (avgScore >= 70) color = "blue";
+        else if (avgScore >= 60) color = "yellow";
+        else color = "red";
+
+        return {
+          section: sectionKey,
+          avgScore: Math.round(avgScore),
+          students: students.length,
+          participation,
+          trend,
+          color,
+          avgAccuracy: Math.round(avgAccuracy)
+        };
+      })
+      .filter(section => section.students > 0)
+      .sort((a, b) => b.avgScore - a.avgScore);
+
+    // Calculate subject trends from quiz data
+    const subjectQuizzes = quizzes.reduce((acc: Record<string, any[]>, quiz: any) => {
+      if (!acc[quiz.subject]) {
+        acc[quiz.subject] = [];
+      }
+      acc[quiz.subject].push(quiz);
+      return acc;
+    }, {} as Record<string, any[]>);
+
+    const subjectTrends = Object.entries(subjectQuizzes)
+      .map(([subject, subjectQuizList]: [string, any[]]) => {
+        const subjectQuizCodes = subjectQuizList.map((q: any) => q.code);
+        const subjectResults = quizResults.filter((r: any) => subjectQuizCodes.includes(r.quizcode));
+        
+        if (subjectResults.length === 0) return null;
+        
+        const avgScore = Math.round(subjectResults.reduce((sum: number, r: any) => sum + (r.score || 0), 0) / subjectResults.length);
+        
+        // Calculate trend by comparing first half vs second half of results
+        const sortedResults = subjectResults.sort((a: any, b: any) => new Date(a.submittedat).getTime() - new Date(b.submittedat).getTime());
+        let trendPercent = "+0%";
+        let color = "blue";
+        
+        if (sortedResults.length >= 4) {
+          const firstHalf = sortedResults.slice(0, Math.floor(sortedResults.length / 2));
+          const secondHalf = sortedResults.slice(Math.floor(sortedResults.length / 2));
+          
+          const firstAvg = firstHalf.reduce((sum: number, r: any) => sum + (r.score || 0), 0) / firstHalf.length;
+          const secondAvg = secondHalf.reduce((sum: number, r: any) => sum + (r.score || 0), 0) / secondHalf.length;
+          
+          const trendValue = Math.round(((secondAvg - firstAvg) / firstAvg) * 100);
+          trendPercent = `${trendValue > 0 ? '+' : ''}${trendValue}%`;
+          
+          if (trendValue > 0) color = "green";
+          else if (trendValue < -5) color = "red";
+          else color = "blue";
+        }
+
+        return {
+          subject,
+          score: avgScore,
+          trend: trendPercent,
+          color
+        };
+      })
+      .filter((item): item is NonNullable<typeof item> => item !== null)
+      .slice(0, 5); // Limit to 5 subjects
+
+    return {
+      sections: sectionData,
+      subjectTrends,
+      insights: [],
+      totalSections: sectionData.length,
+      avgParticipation: sectionData.length > 0 ? Math.round(sectionData.reduce((sum: number, s: any) => sum + s.participation, 0) / sectionData.length) : 0,
+      topPerformer: sectionData.length > 0 ? sectionData[0] : null
+    };
+  }, [studentsWithPerformance, quizResults, quizzes]);
+
+  // Department Performance Analytics (using real data from quizResults and studentsWithPerformance)
+  const departmentAnalytics = useMemo(() => {
+    if (!studentsWithPerformance || studentsWithPerformance.length === 0 || !quizResults || quizResults.length === 0) {
+      return {
+        departments: [],
+        insights: ["No data available for department analytics"],
+        totalDepartments: 0,
+        avgParticipation: 0,
+        topPerformer: null
+      };
+    }
+
+    // Group students by department
+    const departmentGroups = studentsWithPerformance.reduce((acc: Record<string, any[]>, student: any) => {
+      const department = student.department || 'Unknown';
+      if (!acc[department]) {
+        acc[department] = [];
+      }
+      acc[department].push(student);
+      return acc;
+    }, {} as Record<string, any[]>);
+
+    // Calculate department performance data
+    const departmentData = Object.entries(departmentGroups)
+      .map(([department, students]: [string, any[]]) => {
+        if (students.length === 0) return null;
+
+        const avgScore = students.reduce((sum: number, s: any) => sum + (s.calculatedAvgScore || 0), 0) / students.length;
+        const avgAccuracy = students.reduce((sum: number, s: any) => sum + (s.calculatedAccuracy || 0), 0) / students.length;
+        
+        // Calculate participation from quiz results
+        const departmentStudentIds = students.map((s: any) => s.id);
+        const departmentQuizResults = quizResults.filter((r: any) => departmentStudentIds.includes(r.studentid));
+        const participatingStudents = new Set(departmentQuizResults.map((r: any) => r.studentid)).size;
+        const participation = Math.round((participatingStudents / students.length) * 100);
+        
+        // Determine trend based on recent quiz results
+        const recentResults = departmentQuizResults
+          .sort((a: any, b: any) => new Date(b.submittedat).getTime() - new Date(a.submittedat).getTime())
+          .slice(0, 20); // Get more results for department level
+        
+        let trend = "stable";
+        let growth = "0%";
+        
+        if (recentResults.length >= 4) {
+          const firstHalf = recentResults.slice(0, Math.floor(recentResults.length / 2));
+          const secondHalf = recentResults.slice(Math.floor(recentResults.length / 2));
+          
+          const firstAvg = firstHalf.reduce((sum: number, r: any) => sum + (r.score || 0), 0) / firstHalf.length;
+          const secondAvg = secondHalf.reduce((sum: number, r: any) => sum + (r.score || 0), 0) / secondHalf.length;
+          
+          const growthPercent = Math.round(((firstAvg - secondAvg) / secondAvg) * 100);
+          
+          if (firstAvg > secondAvg + 3) {
+            trend = "up";
+            growth = `+${growthPercent}%`;
+          } else if (secondAvg > firstAvg + 3) {
+            trend = "down"; 
+            growth = `-${Math.abs(growthPercent)}%`;
+          } else {
+            growth = `${growthPercent >= 0 ? '+' : ''}${growthPercent}%`;
+          }
+        }
+
+        // Assign colors based on performance
+        let color = "blue";
+        if (avgScore >= 80) color = "green";
+        else if (avgScore >= 70) color = "blue";
+        else if (avgScore >= 60) color = "purple";
+        else color = "orange";
+
+        return {
+          department,
+          avgScore: Math.round(avgScore),
+          students: students.length,
+          participation,
+          trend,
+          growth,
+          color,
+          avgAccuracy: Math.round(avgAccuracy)
+        };
+      })
+      .filter((dept): dept is NonNullable<typeof dept> => dept !== null && dept.students > 0)
+      .sort((a, b) => b.avgScore - a.avgScore);
+
+    return {
+      departments: departmentData,
+      insights: [],
+      totalDepartments: departmentData.length,
+      avgParticipation: departmentData.length > 0 ? Math.round(departmentData.reduce((sum: number, d: any) => sum + d.participation, 0) / departmentData.length) : 0,
+      topPerformer: departmentData.length > 0 ? departmentData[0] : null
+    };
+  }, [studentsWithPerformance, quizResults]);
+
   const renderStudentHub = () => (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
@@ -825,133 +1809,18 @@ export default function FacultyDashboard() {
         </div>
       </div>
 
-  {/* Group Smart Analytics - Full Advanced Analytics Section */}
-  <Card className="bg-gradient-to-r from-indigo-50 to-green-50 border-0 shadow-lg">
-    <CardHeader>
-      <CardTitle>Smart Analytics (All Students)</CardTitle>
-      <CardDescription>Aggregated advanced metrics, insights, and visualizations</CardDescription>
-    </CardHeader>
-    <CardContent>
-      {studentsLoading ? (
-        <div className="text-gray-500">Loading analytics...</div>
-      ) : allStudents.length === 0 ? (
-        <div className="text-gray-500">No students found.</div>
-      ) : (
-        <div className="space-y-6">
-          {/* Metrics Grid */}
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-            <div className="bg-white/80 rounded-lg p-6 shadow flex flex-col items-center">
-              <div className="text-3xl font-bold text-blue-700">{groupStats ? groupStats.avgScore.toFixed(2) : "N/A"}</div>
-              <div className="text-sm text-gray-600 mt-2">Avg Score</div>
-            </div>
-            <div className="bg-white/80 rounded-lg p-6 shadow flex flex-col items-center">
-              <div className="text-3xl font-bold text-green-700">{groupStats ? groupStats.avgAccuracy.toFixed(2) : "N/A"}%</div>
-              <div className="text-sm text-gray-600 mt-2">Avg Accuracy</div>
-            </div>
-            <div className="bg-white/80 rounded-lg p-6 shadow flex flex-col items-center">
-              <div className="text-3xl font-bold text-indigo-700">{groupStats ? groupStats.total : "N/A"}</div>
-              <div className="text-sm text-gray-600 mt-2">Total Students</div>
-            </div>
-          </div>
-          {/* Top/Bottom Performer */}
-          <div className="flex flex-col md:flex-row gap-6">
-            <div className="flex-1 bg-white/80 rounded-lg p-6 shadow">
-              <div className="font-semibold text-green-700">Top Performer</div>
-              <div className="text-lg font-bold">
-                {groupStats ? (groupStats.top.full_name || groupStats.top.username) : "N/A"}
-              </div>
-              <div className="text-sm text-gray-600">
-                Score: {groupStats ? groupStats.top.avg_score : "N/A"}
-              </div>
-            </div>
-            <div className="flex-1 bg-white/80 rounded-lg p-6 shadow">
-              <div className="font-semibold text-red-700">Lowest Performer</div>
-              <div className="text-lg font-bold">{groupStats ? (groupStats.bottom.full_name || groupStats.bottom.username) : "N/A"}</div>
-              <div className="text-sm text-gray-600">Score: {groupStats ? groupStats.bottom.avg_score : "N/A"}</div>
-            </div>
-          </div>
-          {/* Insights & Milestones */}
-          <div className="flex flex-col gap-2">
-            {/* Example: Add more advanced group insights here as needed */}
-            <div className="text-indigo-700 font-semibold">Most improved section: <span className="font-bold">(Demo)</span></div>
-            <div className="text-blue-700 font-semibold">Highest subject proficiency: <span className="font-bold">(Demo)</span></div>
-            <div className="text-green-700 font-semibold">Milestone: <span className="font-bold">Over 90% average in 2 sections!</span></div>
-          </div>
-          {/* Group Score Trends (Line Chart) */}
-          <div className="bg-white/80 rounded-lg p-6 shadow">
-            <div className="font-semibold mb-2">Group Score Trends</div>
-            {/* Chart.js Line chart for group score trends (demo data) */}
-            <Line
-              data={{
-                labels: ["Jan", "Feb", "Mar", "Apr", "May", "Jun"],
-                datasets: [{
-                  label: "Avg Score",
-                  data: [70, 72, 75, 78, 80, 82],
-                  borderColor: "#6366f1",
-                  backgroundColor: "rgba(99,102,241,0.2)",
-                }],
-              }}
-              options={{
-                responsive: true,
-                plugins: { legend: { display: false } },
-                scales: { y: { min: 0, max: 100 } },
-              }}
-            />
-          </div>
-          {/* Group Subject Proficiency (Radar Chart, demo) */}
-          <div className="bg-white/80 rounded-lg p-6 shadow">
-            <div className="font-semibold mb-2">Group Subject Proficiency</div>
-            <Radar
-              data={{
-                labels: ["Math", "Physics", "Chemistry", "Biology"],
-                datasets: [{
-                  label: "Proficiency",
-                  data: [80, 75, 85, 70],
-                  backgroundColor: "rgba(16,185,129,0.2)",
-                  borderColor: "#10b981",
-                }],
-              }}
-              options={{
-                responsive: true,
-                plugins: { legend: { display: false } },
-                scales: { r: { min: 0, max: 100 } },
-              }}
-            />
-          </div>
-          {/* Group Knowledge Retention (Pie Chart, demo) */}
-          <div className="bg-white/80 rounded-lg p-6 shadow">
-            <div className="font-semibold mb-2">Group Knowledge Retention</div>
-            <Pie
-              data={{
-                labels: ["Retention", "Lost"],
-                datasets: [{
-                  data: [78, 22],
-                  backgroundColor: ["#f59e42", "#e5e7eb"],
-                }],
-              }}
-              options={{
-                responsive: true,
-                plugins: { legend: { display: true, position: "bottom" } },
-              }}
-            />
-          </div>
-        </div>
-      )}
-    </CardContent>
-  </Card>
-
       {/* All Students List */}
       <Card className="bg-white/80 backdrop-blur-sm border-0 shadow-lg">
         <CardHeader>
-          <CardTitle>Registered Students</CardTitle>
-          <CardDescription>Click on any student to view detailed performance</CardDescription>
+          <CardTitle>Students Who Attended Your Quizzes</CardTitle>
+          <CardDescription>Students with real-time performance data from your quiz results</CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
           {studentsLoading ? (
             <div className="text-gray-500">Loading students...</div>
-          ) : allStudents.length === 0 ? (
-            <div className="text-gray-500">No students found.</div>
-          ) : allStudents.map((student) => (
+          ) : studentsWithPerformance.length === 0 ? (
+            <div className="text-gray-500">No students have taken your quizzes yet.</div>
+          ) : studentsWithPerformance.map((student) => (
             <div
               key={student.id}
               className="p-4 bg-gray-50/50 rounded-lg hover:bg-gray-100/50 transition-colors cursor-pointer"
@@ -965,24 +1834,46 @@ export default function FacultyDashboard() {
                         {(student.full_name || student.username || '').slice(0,2).toUpperCase()}
                       </AvatarFallback>
                     </Avatar>
+                    {/* Active indicator for students with recent activity */}
+                    {student.latestQuizDate && new Date().getTime() - student.latestQuizDate.getTime() < 7 * 24 * 60 * 60 * 1000 && (
+                      <div className="absolute -top-1 -right-1 w-4 h-4 bg-green-500 rounded-full border-2 border-white"></div>
+                    )}
                   </div>
                   <div>
                     <div className="flex items-center gap-2">
                       <h3 className="font-semibold text-gray-900">{student.full_name || student.username}</h3>
+                      <Badge variant="outline" className="text-xs">
+                        {student.totalQuizzesTaken} quiz{student.totalQuizzesTaken !== 1 ? 'es' : ''}
+                      </Badge>
                     </div>
                     <p className="text-sm text-gray-600">ID: {student.id}</p>
                     <p className="text-xs text-gray-500">Section: {student.section} | Dept: {student.department}</p>
+                    {student.latestQuizDate && (
+                      <p className="text-xs text-blue-600">
+                        Last activity: {student.latestQuizDate.toLocaleDateString()}
+                      </p>
+                    )}
                   </div>
                 </div>
                 <div className="text-right">
                   <div className="flex items-center gap-4">
                     <div>
-                      <p className="text-lg font-bold text-gray-900">{student.avg_score ?? 'N/A'}%</p>
+                      <p className="text-lg font-bold text-gray-900">{student.calculatedAvgScore}%</p>
                       <p className="text-xs text-gray-600">Avg Score</p>
                     </div>
                     <div>
-                      <p className="text-lg font-bold text-gray-900">{student.accuracy_rate ?? 'N/A'}%</p>
+                      <p className="text-lg font-bold text-gray-900">{student.calculatedAccuracy}%</p>
                       <p className="text-xs text-gray-600">Accuracy</p>
+                    </div>
+                    <div className="flex flex-col items-center">
+                      <div className={`w-3 h-3 rounded-full ${
+                        student.calculatedAvgScore >= 80 ? 'bg-green-500' :
+                        student.calculatedAvgScore >= 60 ? 'bg-yellow-500' : 'bg-red-500'
+                      }`}></div>
+                      <p className="text-xs text-gray-500 mt-1">
+                        {student.calculatedAvgScore >= 80 ? 'Excellent' :
+                         student.calculatedAvgScore >= 60 ? 'Good' : 'Needs Help'}
+                      </p>
                     </div>
                   </div>
                 </div>
@@ -1353,6 +2244,194 @@ export default function FacultyDashboard() {
 
       {/* Student Detail Modal */}
       {renderStudentModal()}
+
+      {/* View Quiz Modal */}
+      <Dialog open={viewQuizModal.isOpen} onOpenChange={(open) => setViewQuizModal({ isOpen: open, quiz: null })}>
+        <DialogContent className="max-w-4xl max-h-[90vh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Eye className="w-5 h-5" />
+              {viewQuizModal.quiz?.title}
+            </DialogTitle>
+            <DialogDescription>
+              Code: {viewQuizModal.quiz?.code} • {viewQuizModal.quiz?.questions?.length || 0} Questions • {viewQuizModal.quiz?.difficulty} Difficulty
+            </DialogDescription>
+          </DialogHeader>
+          {viewQuizModal.quiz && (
+            <div className="space-y-6">
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <Label className="text-sm font-medium">Subject</Label>
+                  <p className="text-sm text-gray-600">{viewQuizModal.quiz.subject}</p>
+                </div>
+                <div>
+                  <Label className="text-sm font-medium">Category</Label>
+                  <p className="text-sm text-gray-600">{viewQuizModal.quiz.category}</p>
+                </div>
+                <div>
+                  <Label className="text-sm font-medium">Time Limit</Label>
+                  <p className="text-sm text-gray-600">{viewQuizModal.quiz.timeLimit} minutes</p>
+                </div>
+                <div>
+                  <Label className="text-sm font-medium">Status</Label>
+                  <Badge variant={viewQuizModal.quiz.status === "active" ? "default" : "secondary"}>
+                    {viewQuizModal.quiz.status}
+                  </Badge>
+                </div>
+              </div>
+              
+              <div>
+                <Label className="text-sm font-medium">Description</Label>
+                <p className="text-sm text-gray-600 mt-1">{viewQuizModal.quiz.description || "No description provided"}</p>
+              </div>
+
+              <div>
+                <Label className="text-lg font-semibold">Questions Preview</Label>
+                <div className="space-y-4 mt-3">
+                  {viewQuizModal.quiz.questions?.slice(0, 5).map((question: any, index: number) => (
+                    <div key={index} className="p-4 border rounded-lg">
+                      <div className="flex items-start justify-between mb-2">
+                        <h4 className="font-medium">Question {index + 1}</h4>
+                        <Badge variant="outline">{question.type}</Badge>
+                      </div>
+                      <p className="text-sm mb-3">{question.question}</p>
+                      {question.type === "multiple-choice" && (
+                        <div className="space-y-1">
+                          {question.options?.map((option: string, optIndex: number) => (
+                            <div key={optIndex} className="flex items-center gap-2">
+                              <div className={`w-2 h-2 rounded-full ${optIndex === Number(question.correctAnswer) ? 'bg-green-500' : 'bg-gray-300'}`} />
+                              <span className="text-sm">{option}</span>
+                              {optIndex === Number(question.correctAnswer) && (
+                                <Badge variant="secondary" className="text-xs">Correct</Badge>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                      {(question.type === "true-false" || question.type === "short-answer") && (
+                        <div className="text-sm">
+                          <span className="font-medium">Correct Answer:</span> {question.correctAnswer}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                  {viewQuizModal.quiz.questions?.length > 5 && (
+                    <p className="text-sm text-gray-500 text-center">
+                      ... and {viewQuizModal.quiz.questions.length - 5} more questions
+                    </p>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
+
+      {/* Quiz Analytics Modal */}
+      <Dialog open={analyticsModal.isOpen} onOpenChange={(open) => setAnalyticsModal({ isOpen: open, quiz: null })}>
+        <DialogContent className="max-w-4xl max-h-[90vh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <BarChart3 className="w-5 h-5" />
+              Analytics: {analyticsModal.quiz?.title}
+            </DialogTitle>
+            <DialogDescription>
+              Detailed performance analytics for this quiz
+            </DialogDescription>
+          </DialogHeader>
+          {analyticsModal.quiz && (
+            <div className="space-y-6">
+              {(() => {
+                const quizSubmissions = quizResults.filter(r => r.quizcode === analyticsModal.quiz.code);
+                const totalSubmissions = quizSubmissions.length;
+                const avgScore = totalSubmissions > 0 
+                  ? Math.round(quizSubmissions.reduce((sum, r) => sum + (r.score || 0), 0) / totalSubmissions)
+                  : 0;
+                const highestScore = totalSubmissions > 0 
+                  ? Math.max(...quizSubmissions.map(r => r.score || 0))
+                  : 0;
+                const lowestScore = totalSubmissions > 0 
+                  ? Math.min(...quizSubmissions.map(r => r.score || 0))
+                  : 0;
+                
+                return (
+                  <>
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                      <Card>
+                        <CardContent className="p-4">
+                          <div className="text-2xl font-bold">{totalSubmissions}</div>
+                          <p className="text-sm text-gray-600">Total Submissions</p>
+                        </CardContent>
+                      </Card>
+                      <Card>
+                        <CardContent className="p-4">
+                          <div className="text-2xl font-bold text-blue-600">{avgScore}%</div>
+                          <p className="text-sm text-gray-600">Average Score</p>
+                        </CardContent>
+                      </Card>
+                      <Card>
+                        <CardContent className="p-4">
+                          <div className="text-2xl font-bold text-green-600">{highestScore}%</div>
+                          <p className="text-sm text-gray-600">Highest Score</p>
+                        </CardContent>
+                      </Card>
+                      <Card>
+                        <CardContent className="p-4">
+                          <div className="text-2xl font-bold text-red-600">{lowestScore}%</div>
+                          <p className="text-sm text-gray-600">Lowest Score</p>
+                        </CardContent>
+                      </Card>
+                    </div>
+
+                    {totalSubmissions > 0 && (
+                      <div>
+                        <h3 className="text-lg font-semibold mb-4">Recent Submissions</h3>
+                        <div className="space-y-2 max-h-60 overflow-y-auto">
+                          {quizSubmissions
+                            .sort((a, b) => new Date(b.submittedat).getTime() - new Date(a.submittedat).getTime())
+                            .slice(0, 10)
+                            .map((result, index) => (
+                              <div key={index} className="flex items-center justify-between p-3 border rounded-lg">
+                                <div className="flex items-center gap-3">
+                                  <Avatar className="w-8 h-8">
+                                    <AvatarFallback>
+                                      {result.studentid.substring(0, 2).toUpperCase()}
+                                    </AvatarFallback>
+                                  </Avatar>
+                                  <div>
+                                    <p className="font-medium text-sm">Student {result.studentid.substring(0, 8)}</p>
+                                    <p className="text-xs text-gray-500">
+                                      {new Date(result.submittedat).toLocaleString()}
+                                    </p>
+                                  </div>
+                                </div>
+                                <div className="flex items-center gap-2">
+                                  <Badge variant={result.score >= 80 ? "default" : result.score >= 60 ? "secondary" : "destructive"}>
+                                    {result.score}%
+                                  </Badge>
+                                  <div className="text-xs text-gray-500">
+                                    {result.correct_answers}/{result.total_questions}
+                                  </div>
+                                </div>
+                              </div>
+                            ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {totalSubmissions === 0 && (
+                      <div className="text-center py-8">
+                        <BarChart3 className="w-12 h-12 text-gray-400 mx-auto mb-4" />
+                        <p className="text-gray-500">No submissions yet for this quiz</p>
+                      </div>
+                    )}
+                  </>
+                );
+              })()}
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }
