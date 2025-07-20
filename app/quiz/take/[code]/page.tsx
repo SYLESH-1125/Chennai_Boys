@@ -147,14 +147,28 @@ export default function TakeQuizPage() {
         totalPoints += question.points;
         const userAnswer = answers[question.id];
         let isCorrect = false;
+        
+        console.log(`Question ${question.id} - User Answer:`, userAnswer, `Correct Answer:`, question.correctAnswer);
+        
         if (question.type === "multiple-choice") {
-          const correctOption = question.options[question.correctAnswer];
-          isCorrect = String(userAnswer).trim().toLowerCase() === String(correctOption).trim().toLowerCase();
+          // Handle both index-based and text-based answers
+          if (typeof userAnswer === 'number') {
+            // User answer is an index
+            isCorrect = userAnswer === question.correctAnswer;
+          } else if (typeof userAnswer === 'string') {
+            // User answer is option text - find matching option
+            const userAnswerIndex = question.options.findIndex((opt: string) => 
+              String(opt).trim().toLowerCase() === String(userAnswer).trim().toLowerCase()
+            );
+            isCorrect = userAnswerIndex === question.correctAnswer;
+          }
         } else if (question.type === "true-false") {
           isCorrect = String(userAnswer).toLowerCase() === String(question.correctAnswer).toLowerCase();
         } else if (question.type === "short-answer" || question.type === "fill-in-the-blanks") {
           isCorrect = String(userAnswer).trim().toLowerCase() === String(question.correctAnswer).trim().toLowerCase();
         }
+        
+        console.log(`Question ${question.id} - Is Correct:`, isCorrect);
         if (isCorrect) {
           correctAnswers++;
           earnedPoints += question.points;
@@ -176,28 +190,170 @@ export default function TakeQuizPage() {
         timeSpent = quiz.timeLimit ? quiz.timeLimit - timeLeft : 0;
         if (timeSpent < 0) timeSpent = 0;
       }
-      // Save result to Supabase with all columns
-      const result = {
-        student_id: user.id,
-        quiz_id: quiz.id,
-        score: scorePercent, // store percent
-        attempts: 1,
-        status: "completed",
-        taken_at: new Date().toISOString(),
-        answers, // student's answers (object)
-        correct_answers: correctAnswers,
-        total_questions: quiz.questions.length,
-        time_spent: timeSpent,
+      // Save result to students table quiz_history column
+      // Prepare correct answers in the expected format for PDF
+      const correctAnswersMap: Record<string, any> = {};
+      quiz.questions.forEach((question: any) => {
+        correctAnswersMap[question.id] = question.correctAnswer;
+      });
+
+      // Convert answers to the format expected by PDF generator
+      const processedAnswers: Record<string, any> = {};
+      quiz.questions.forEach((question: any) => {
+        const userAnswer = answers[question.id];
+        if (question.type === "multiple-choice" && typeof userAnswer === 'string') {
+          // Convert text answer to index for PDF generator
+          const answerIndex = question.options.findIndex((opt: string) => 
+            String(opt).trim().toLowerCase() === String(userAnswer).trim().toLowerCase()
+          );
+          processedAnswers[question.id] = answerIndex >= 0 ? answerIndex : userAnswer;
+        } else {
+          processedAnswers[question.id] = userAnswer;
+        }
+      });
+
+      // Create a clean, serializable version of quiz result
+      const quizResult = {
+        quiz_id: String(quiz.id || ''),
+        quiz_code: String(quiz.code || ''),
+        quiz_title: String(quiz.title || 'Untitled Quiz'),
+        subject: String(quiz.subject || 'General'),
+        score: Number(scorePercent) || 0,
+        total_questions: Number(quiz.questions.length) || 0,
+        correct_answers: Number(correctAnswers) || 0, // Store the COUNT, not the mappings
+        time_spent: Number(timeSpent) || 0,
+        answers: processedAnswers || {}, // Use processed answers
+        correct_answer_mappings: correctAnswersMap || {}, // Store correct answer mappings separately
+        questions: quiz.questions.map((q: any) => {
+          // Create a clean question object without potential circular references
+          return {
+            id: String(q.id || ''),
+            type: String(q.type || 'multiple-choice'),
+            question: String(q.question || '').substring(0, 1000), // Limit question length
+            options: Array.isArray(q.options) ? q.options.map(opt => String(opt).substring(0, 200)) : [],
+            correctAnswer: q.correctAnswer,
+            explanation: String(q.explanation || '').substring(0, 2000), // Limit explanation length
+            points: Number(q.points) || 1
+          };
+        }),
         submitted_at: new Date().toISOString(),
+        taken_at: new Date().toISOString(), // Add for backwards compatibility
+        status: "completed"
       };
-      const { error: insertError } = await supabase.from("quiz_results").insert([result]);
-      if (insertError) {
-        setError("Failed to submit quiz: " + insertError.message);
+
+      // Validate the JSON structure before storing
+      try {
+        const jsonString = JSON.stringify(quizResult);
+        const jsonSize = new Blob([jsonString]).size;
+        console.log(`Quiz result JSON size: ${jsonSize} bytes`);
+        
+        if (jsonSize > 1000000) { // 1MB limit
+          throw new Error(`Quiz data too large (${jsonSize} bytes). Reducing data size...`);
+        }
+        
+        // Test JSON parse
+        JSON.parse(jsonString);
+        console.log("Quiz result JSON validation passed");
+      } catch (jsonError) {
+        console.error("JSON validation failed:", jsonError);
+        
+        // Create minimal fallback version
+        const minimalResult = {
+          quiz_id: String(quiz.id || ''),
+          quiz_code: String(quiz.code || ''),
+          quiz_title: String(quiz.title || 'Quiz'),
+          score: Number(scorePercent) || 0,
+          total_questions: Number(quiz.questions.length) || 0,
+          correct_answers: Number(correctAnswers) || 0,
+          submitted_at: new Date().toISOString(),
+          taken_at: new Date().toISOString(),
+          status: "completed"
+        };
+        
+        console.log("Using minimal quiz result due to JSON error");
+        Object.assign(quizResult, minimalResult);
+      }
+
+      // Get current student data
+      const { data: studentData, error: fetchError } = await supabase
+        .from("students")
+        .select("quiz_history")
+        .eq("id", user.id)
+        .single();
+
+      if (fetchError) {
+        console.error("Fetch student data error:", fetchError);
+        setError("Failed to fetch student data: " + fetchError.message + " (Code: " + fetchError.code + ")");
         setIsSubmitting(false);
         return;
       }
-      // Update student's quiz_history with titles
-      await updateStudentQuizHistory(user.id);
+
+      // Add validation and debug logging
+      console.log("Current student data:", studentData);
+      console.log("Quiz result to be stored:", quizResult);
+
+      // Add new result to quiz_history array with safety checks
+      const currentHistory = Array.isArray(studentData?.quiz_history) ? studentData.quiz_history : [];
+      
+      // Limit history size to prevent database issues
+      const maxHistoryItems = 100;
+      const trimmedHistory = currentHistory.length >= maxHistoryItems ? 
+        currentHistory.slice(-maxHistoryItems + 1) : currentHistory;
+      
+      const updatedHistory = [...trimmedHistory, quizResult];
+
+      console.log("Updated quiz history length:", updatedHistory.length);
+      console.log("Sample quiz result keys:", Object.keys(quizResult));
+
+      // Update student record with new quiz_history
+      const { data: updateData, error: updateError } = await supabase
+        .from("students")
+        .update({ quiz_history: updatedHistory })
+        .eq("id", user.id)
+        .select(); // Add select to get response data
+
+      console.log("Database update response:", updateData);
+
+      if (updateError) {
+        console.error("Update student data error:", updateError);
+        console.error("Error details:", {
+          message: updateError.message,
+          details: updateError.details,
+          hint: updateError.hint,
+          code: updateError.code
+        });
+        
+        // Try an even simpler fallback approach
+        console.log("Trying ultra-simple fallback storage method...");
+        const ultraSimpleResult = {
+          quiz_code: String(quiz.code || 'unknown'),
+          quiz_id: String(quiz.id || ''),
+          quiz_title: String(quiz.title || 'Quiz'),
+          score: Number(scorePercent) || 0,
+          total_questions: Number(quiz.questions.length) || 0,
+          correct_answers: Number(correctAnswers) || 0,
+          taken_at: new Date().toISOString(),
+          status: "completed"
+        };
+        
+        const { error: fallbackError } = await supabase
+          .from("students")
+          .update({ 
+            quiz_history: [ultraSimpleResult] // Just store this one result
+          })
+          .eq("id", user.id);
+          
+        if (fallbackError) {
+          console.error("Ultra-simple fallback also failed:", fallbackError);
+          setError(`Database error: ${updateError.message || 'Unknown error'}. Please check browser console for details.`);
+          setIsSubmitting(false);
+          return;
+        } else {
+          console.log("Ultra-simple fallback storage successful");
+        }
+      } else {
+        console.log("Quiz submission successful!");
+      }
       setResultData({ correctAnswers, totalQuestions: quiz.questions.length, score: scorePercent });
       setShowResult(true);
       // Cleanup startTime and shuffled questions from localStorage after submit

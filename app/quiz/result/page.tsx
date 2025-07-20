@@ -32,6 +32,7 @@ export default function QuizResultPage() {
   const { data: session, status } = useSession()
   const [result, setResult] = useState<QuizResult | null>(null)
   const [isLoading, setIsLoading] = useState(true)
+  const [quizData, setQuizData] = useState<any>(null) // Store full quiz data for download
 
   const resultId = searchParams.get("id")
 
@@ -46,13 +47,180 @@ export default function QuizResultPage() {
     }
   }, [session, status, resultId])
 
-  const loadResult = () => {
+  // Download quiz with answers and explanations
+  const downloadQuizPDF = async () => {
+    if (!result || !quizData) return;
+    
+    try {
+      const { jsPDF } = await import('jspdf');
+      const doc = new jsPDF();
+      
+      // Title page
+      doc.setFontSize(24);
+      doc.setTextColor(40, 40, 40);
+      doc.text(`${result.quizTitle}`, 20, 30);
+      
+      doc.setFontSize(16);
+      doc.setTextColor(100, 100, 100);
+      doc.text(`Quiz Code: ${result.quizCode}`, 20, 45);
+      doc.text(`Student: ${result.studentName}`, 20, 55);
+      doc.text(`Score: ${result.score}% (${result.correctAnswers}/${result.totalQuestions})`, 20, 65);
+      doc.text(`Date: ${new Date(result.submittedAt).toLocaleDateString()}`, 20, 75);
+      
+      let yPosition = 95;
+      
+      // Performance Summary
+      doc.setFontSize(18);
+      doc.setTextColor(40, 40, 40);
+      doc.text('Performance Summary', 20, yPosition);
+      yPosition += 15;
+      
+      doc.setFontSize(12);
+      doc.setTextColor(60, 60, 60);
+      doc.text(`Time Spent: ${Math.floor(result.timeSpent / 60)}:${(result.timeSpent % 60).toString().padStart(2, '0')}`, 25, yPosition);
+      yPosition += 8;
+      doc.text(`Accuracy: ${Math.round((result.correctAnswers / result.totalQuestions) * 100)}%`, 25, yPosition);
+      yPosition += 8;
+      
+      const performance = result.score >= 90 ? 'Excellent' : 
+                         result.score >= 80 ? 'Very Good' : 
+                         result.score >= 70 ? 'Good' : 
+                         result.score >= 60 ? 'Average' : 'Needs Improvement';
+      doc.text(`Performance Level: ${performance}`, 25, yPosition);
+      yPosition += 20;
+      
+      // Questions and Answers
+      doc.setFontSize(16);
+      doc.text('Quiz Questions and Answers', 20, yPosition);
+      yPosition += 15;
+      
+      const questions = quizData.questions || [];
+      
+      questions.forEach((question: any, index: number) => {
+        if (yPosition > 250) {
+          doc.addPage();
+          yPosition = 30;
+        }
+        
+        // Question
+        doc.setFontSize(14);
+        doc.setTextColor(40, 40, 40);
+        const questionText = `${index + 1}. ${question.question}`;
+        const questionLines = doc.splitTextToSize(questionText, 170);
+        doc.text(questionLines, 20, yPosition);
+        yPosition += questionLines.length * 7 + 5;
+        
+        // Options for multiple choice questions
+        if (question.type === 'multiple-choice' && question.options) {
+          doc.setFontSize(12);
+          question.options.forEach((option: string, optIndex: number) => {
+            const optionPrefix = String.fromCharCode(65 + optIndex); // A, B, C, D
+            const isCorrect = question.correctAnswer === optIndex;
+            const isUserAnswer = result.answers[index] === optIndex;
+            
+            doc.setTextColor(60, 60, 60);
+            if (isCorrect) {
+              doc.setTextColor(0, 128, 0); // Green for correct answer
+            } else if (isUserAnswer) {
+              doc.setTextColor(255, 0, 0); // Red for wrong user answer
+            }
+            
+            const optionText = `${optionPrefix}. ${option} ${isCorrect ? '✓ (Correct)' : ''} ${isUserAnswer && !isCorrect ? '✗ (Your Answer)' : ''}`;
+            const optionLines = doc.splitTextToSize(optionText, 160);
+            doc.text(optionLines, 30, yPosition);
+            yPosition += optionLines.length * 6 + 3;
+          });
+        } else {
+          // For other question types, show correct answer
+          doc.setFontSize(12);
+          doc.setTextColor(0, 128, 0);
+          doc.text(`Correct Answer: ${question.correctAnswer}`, 30, yPosition);
+          yPosition += 10;
+          
+          if (result.answers[index] !== undefined) {
+            const isUserAnswerCorrect = result.answers[index] === question.correctAnswer;
+            doc.setTextColor(isUserAnswerCorrect ? 0 : 255, isUserAnswerCorrect ? 128 : 0, 0);
+            doc.text(`Your Answer: ${result.answers[index]}`, 30, yPosition);
+            yPosition += 10;
+          }
+        }
+        
+        // Explanation
+        if (question.explanation) {
+          doc.setFontSize(11);
+          doc.setTextColor(80, 80, 80);
+          doc.text('Explanation:', 30, yPosition);
+          yPosition += 7;
+          
+          const explanationLines = doc.splitTextToSize(question.explanation, 160);
+          doc.text(explanationLines, 30, yPosition);
+          yPosition += explanationLines.length * 6 + 10;
+        }
+        
+        yPosition += 5; // Extra space between questions
+      });
+      
+      // Study recommendations (if score < 80%)
+      if (result.score < 80) {
+        if (yPosition > 200) {
+          doc.addPage();
+          yPosition = 30;
+        }
+        
+        doc.setFontSize(16);
+        doc.setTextColor(40, 40, 40);
+        doc.text('Study Recommendations', 20, yPosition);
+        yPosition += 15;
+        
+        doc.setFontSize(12);
+        doc.setTextColor(60, 60, 60);
+        
+        const recommendations = [
+          'Review the questions you answered incorrectly',
+          'Focus on the explanations provided for each question',
+          'Practice similar topics to improve understanding',
+          'Consider discussing difficult concepts with your instructor',
+          'Take practice quizzes to reinforce learning'
+        ];
+        
+        recommendations.forEach((rec, index) => {
+          doc.text(`• ${rec}`, 25, yPosition);
+          yPosition += 10;
+        });
+      }
+      
+      // Save the PDF
+      doc.save(`${result.quizTitle}_${result.studentName}_Result.pdf`);
+      
+    } catch (error) {
+      console.error('Error generating PDF:', error);
+      alert('Failed to generate PDF. Please try again.');
+    }
+  };
+
+  const loadResult = async () => {
     const savedResults = localStorage.getItem("quiz_results")
     if (savedResults) {
       const results = JSON.parse(savedResults)
       const foundResult = results.find((r: QuizResult) => r.id === resultId)
       if (foundResult) {
         setResult(foundResult)
+        
+        // Also fetch the quiz data for PDF generation
+        try {
+          const { supabase } = await import("@/lib/supabase");
+          const { data: quiz, error } = await supabase
+            .from('quizzes')
+            .select('*')
+            .eq('code', foundResult.quizCode)
+            .single();
+            
+          if (quiz && !error) {
+            setQuizData(quiz);
+          }
+        } catch (error) {
+          console.error('Error fetching quiz data:', error);
+        }
       }
     }
     setIsLoading(false)
@@ -224,9 +392,9 @@ export default function QuizResultPage() {
             <Share2 className="mr-2 h-4 w-4" />
             Share Result
           </Button>
-          <Button variant="outline">
+          <Button variant="outline" onClick={downloadQuizPDF}>
             <Download className="mr-2 h-4 w-4" />
-            Download Certificate
+            Download Quiz Report
           </Button>
         </div>
 

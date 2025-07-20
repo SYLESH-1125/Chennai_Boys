@@ -37,6 +37,7 @@ import {
 import { Line } from "react-chartjs-2"
 import { useAuth } from "@/contexts/auth-context"
 import { supabase } from "@/lib/supabase";
+import { generateStudentQuizDetailedPDF } from "@/lib/pdf-generator";
 import jsPDF from 'jspdf';
 
 ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend)
@@ -92,6 +93,130 @@ function useStudentProfile(userId: any) {
   }, [userId]);
 
   return student;
+}
+
+// Hook for real-time available quizzes
+function useAvailableQuizzes() {
+  const [availableQuizzes, setAvailableQuizzes] = useState<any[]>([]);
+  const [quizzesLoading, setQuizzesLoading] = useState(true);
+
+  useEffect(() => {
+    let quizzesChannel: any = null;
+    
+    const fetchAndSubscribeQuizzes = async () => {
+      setQuizzesLoading(true);
+      
+      try {
+        // Fetch currently available quizzes
+        const { data, error } = await supabase
+          .from('quizzes')
+          .select('*')
+          .eq('status', 'active')
+          .order('created_at', { ascending: false });
+        
+        if (!error && data) {
+          setAvailableQuizzes(data);
+        }
+        
+        // Set up real-time subscription for quiz availability changes
+        quizzesChannel = supabase.channel('student-available-quizzes')
+          .on('postgres_changes', {
+            event: '*',
+            schema: 'public',
+            table: 'quizzes'
+          }, (payload: any) => {
+            console.log('Quiz availability update:', payload);
+            
+            if (payload.eventType === 'INSERT' && payload.new.status === 'active') {
+              // New active quiz added
+              setAvailableQuizzes(prev => [payload.new, ...prev]);
+            } else if (payload.eventType === 'UPDATE') {
+              if (payload.new.status === 'active') {
+                // Quiz became active or was updated while active
+                setAvailableQuizzes(prev => {
+                  const existingIndex = prev.findIndex(q => q.id === payload.new.id);
+                  if (existingIndex >= 0) {
+                    // Update existing quiz
+                    return prev.map(quiz => 
+                      quiz.id === payload.new.id ? payload.new : quiz
+                    );
+                  } else {
+                    // Add newly active quiz
+                    return [payload.new, ...prev];
+                  }
+                });
+              } else {
+                // Quiz became inactive
+                setAvailableQuizzes(prev => prev.filter(quiz => quiz.id !== payload.new.id));
+              }
+            } else if (payload.eventType === 'DELETE') {
+              // Quiz deleted
+              setAvailableQuizzes(prev => prev.filter(quiz => quiz.id !== payload.old.id));
+            }
+          })
+          .subscribe();
+          
+      } catch (error) {
+        console.error('Error fetching quizzes:', error);
+      }
+      
+      setQuizzesLoading(false);
+    };
+    
+    fetchAndSubscribeQuizzes();
+    
+    return () => {
+      if (quizzesChannel) quizzesChannel.unsubscribe();
+    };
+  }, []);
+
+  return { availableQuizzes, quizzesLoading };
+}
+
+// Live Activity Indicator Component
+function LiveActivityIndicator({ isActive }: { isActive: boolean }) {
+  return (
+    <div className="flex items-center space-x-2">
+      <div className={`w-2 h-2 rounded-full ${isActive ? 'bg-green-500 animate-pulse' : 'bg-gray-300'}`}></div>
+      <span className="text-xs text-gray-600">
+        {isActive ? 'Live' : 'Offline'}
+      </span>
+    </div>
+  );
+}
+
+// Last updated timestamp component
+function LastUpdated({ timestamp }: { timestamp?: string }) {
+  const [timeAgo, setTimeAgo] = useState('');
+  
+  useEffect(() => {
+    if (!timestamp) return;
+    
+    const updateTimeAgo = () => {
+      const now = new Date();
+      const updated = new Date(timestamp);
+      const diffMs = now.getTime() - updated.getTime();
+      const diffMinutes = Math.floor(diffMs / 60000);
+      
+      if (diffMinutes < 1) {
+        setTimeAgo('Just updated');
+      } else if (diffMinutes < 60) {
+        setTimeAgo(`Updated ${diffMinutes}m ago`);
+      } else {
+        const diffHours = Math.floor(diffMinutes / 60);
+        setTimeAgo(`Updated ${diffHours}h ago`);
+      }
+    };
+    
+    updateTimeAgo();
+    const interval = setInterval(updateTimeAgo, 60000); // Update every minute
+    
+    return () => clearInterval(interval);
+  }, [timestamp]);
+  
+  return timestamp ? (
+    <span className="text-xs text-gray-500">{timeAgo}</span>
+  ) : null;
 }
 
 // Add a helper function for formatting time
@@ -152,6 +277,12 @@ export default function StudentDashboard() {
     { label: "Department", value: "Department" },
     { label: "Section", value: "Section" },
   ];
+
+  // Use the new real-time available quizzes hook
+  const { availableQuizzes, quizzesLoading } = useAvailableQuizzes();
+  
+  // Track last update time for real-time indicators
+  const [lastUpdateTime, setLastUpdateTime] = useState<string>(new Date().toISOString());
 
   // Define fetchLeaderboards at the top level
   const fetchLeaderboards = async () => {
@@ -218,6 +349,9 @@ export default function StudentDashboard() {
         setSectionStudents(sect || []);
       }
     }
+    
+    // Update last update timestamp
+    setLastUpdateTime(new Date().toISOString());
   };
 
   useEffect(() => {
@@ -259,12 +393,35 @@ export default function StudentDashboard() {
     const fetchQuizResults = async () => {
       setLoadingData(true);
       if (!user) return;
-      const { data, error } = await supabase
-        .from('quiz_results')
-        .select('*, quizzes(*)')
-        .eq('student_id', user.id)
-        .order('taken_at', { ascending: false });
-      setQuizResults(data || []);
+      
+      // Get student's quiz_history from students table
+      const { data: studentData, error } = await supabase
+        .from('students')
+        .select('quiz_history')
+        .eq('id', user.id)
+        .single();
+      
+      if (error || !studentData?.quiz_history) {
+        setQuizResults([]);
+        setLoadingData(false);
+        return;
+      }
+      
+      // Convert quiz_history to the expected format
+      const results = studentData.quiz_history.map((result: any) => ({
+        ...result,
+        id: result.quiz_id,
+        student_id: user.id,
+        taken_at: result.submitted_at,
+        quizzes: {
+          id: result.quiz_id,
+          code: result.quiz_code,
+          title: result.quiz_title,
+          subject: result.subject
+        }
+      }));
+      
+      setQuizResults(results || []);
       setLoadingData(false);
     };
     if (user) fetchQuizResults();
@@ -274,18 +431,21 @@ export default function StudentDashboard() {
     // Helper functions to refetch all student views
     const refetchAllStudentViews = async () => {
       await fetchQuizResults();
-      // Refetch analytics
+      // Refetch analytics from student's quiz_history
       if (user) {
-        const { data } = await supabase
-          .from('quiz_results')
-          .select('*')
-          .eq('student_id', user.id);
-        if (data) {
-          const completed = data.filter(q => q.status === 'completed').length;
-          const averageScore = data.length > 0
-            ? Math.round(data.filter(q => q.score !== null).reduce((sum, q) => sum + (q.score || 0), 0) / data.filter(q => q.score !== null).length)
+        const { data: studentData } = await supabase
+          .from('students')
+          .select('quiz_history')
+          .eq('id', user.id)
+          .single();
+          
+        if (studentData?.quiz_history) {
+          const quizHistory = studentData.quiz_history;
+          const completed = quizHistory.filter((q: any) => q.status === 'completed').length;
+          const averageScore = quizHistory.length > 0
+            ? Math.round(quizHistory.filter((q: any) => q.score !== null).reduce((sum: number, q: any) => sum + (q.score || 0), 0) / quizHistory.filter((q: any) => q.score !== null).length)
             : 0;
-          setAnalytics({ averageScore, totalQuizzes: data.length, completed });
+          setAnalytics({ averageScore, totalQuizzes: quizHistory.length, completed });
         }
       }
       // Refetch classmates and leaderboard
@@ -302,17 +462,17 @@ export default function StudentDashboard() {
 
     if (user) {
       subscription = supabase
-        .channel('student-quiz-results')
+        .channel('student-quiz-history')
         .on(
           'postgres_changes',
           {
-            event: '*',
+            event: 'UPDATE',
             schema: 'public',
-            table: 'quiz_results',
-            filter: `student_id=eq.${user.id}`,
+            table: 'students',
+            filter: `id=eq.${user.id}`,
           },
           (payload) => {
-            // Refetch all student views on any insert/update/delete for this student
+            // Refetch all student views when student's quiz_history is updated
             refetchAllStudentViews();
           }
         )
@@ -344,16 +504,60 @@ export default function StudentDashboard() {
   useEffect(() => {
     const fetchAnalytics = async () => {
       if (!user) return;
-      const { data } = await supabase
-        .from('quiz_results')
-        .select('*')
-        .eq('student_id', user.id);
-      if (data) {
-        const completed = data.filter(q => q.status === 'completed').length;
-        const averageScore = data.length > 0
-          ? Math.round(data.filter(q => q.score !== null).reduce((sum, q) => sum + (q.score || 0), 0) / data.filter(q => q.score !== null).length)
-          : 0;
-        setAnalytics({ averageScore, totalQuizzes: data.length, completed });
+      
+      try {
+        // Use quiz_results table with exact column name from database structure
+        let data = null;
+        let error = null;
+        
+        // Use the correct column name 'studentid' based on actual table structure
+        try {
+          const result = await supabase.from('quiz_results').select('*').eq('studentid', user.id);
+          if (!result.error && result.data) {
+            data = result.data;
+            error = null;
+            console.log("Successfully fetched quiz_results analytics:", data.length, "records");
+          } else if (result.error) {
+            console.log("Quiz results query error:", result.error);
+          }
+        } catch (queryError) {
+          console.log("Quiz results query failed:", queryError);
+        }
+          
+        if (!data || (data && data.length === 0)) {
+          console.log("No quiz data found in quiz_results table, using quiz_history from students table");
+          
+          // Fallback: get analytics from students.quiz_history
+          const { data: studentData } = await supabase
+            .from('students')
+            .select('quiz_history')
+            .eq('id', user.id)
+            .single();
+            
+          if (studentData && studentData.quiz_history && studentData.quiz_history.length > 0) {
+            const quizHistory = studentData.quiz_history;
+            const completed = quizHistory.filter((q: any) => q.status === 'completed').length;
+            const averageScore = quizHistory.length > 0
+              ? Math.round(quizHistory.reduce((sum: number, q: any) => sum + (q.score || 0), 0) / quizHistory.length)
+              : 0;
+            console.log("Using quiz_history analytics:", { totalQuizzes: quizHistory.length, averageScore, completed });
+            setAnalytics({ averageScore, totalQuizzes: quizHistory.length, completed });
+          } else {
+            console.log("No quiz data found anywhere, setting default analytics");
+            setAnalytics({ averageScore: 0, totalQuizzes: 0, completed: 0 });
+          }
+        } else if (data) {
+          const completed = data.filter(q => q.status === 'completed').length;
+          const averageScore = data.length > 0
+            ? Math.round(data.filter(q => q.score !== null).reduce((sum, q) => sum + (q.score || 0), 0) / data.filter(q => q.score !== null).length)
+            : 0;
+          console.log("Using quiz_results analytics:", { totalQuizzes: data.length, averageScore, completed });
+          setAnalytics({ averageScore, totalQuizzes: data.length, completed });
+        }
+      } catch (error) {
+        console.error("Error fetching analytics:", error);
+        // Set default analytics
+        setAnalytics({ averageScore: 0, totalQuizzes: 0, completed: 0 });
       }
     };
     if (user) fetchAnalytics();
@@ -363,6 +567,13 @@ export default function StudentDashboard() {
     console.log('useEffect studentProfile:', studentProfile);
     if (studentProfile) {
       fetchLeaderboards();
+      
+      // Set up periodic refresh every 30 seconds for real-time updates
+      const refreshInterval = setInterval(() => {
+        fetchLeaderboards();
+      }, 30000); // 30 seconds
+      
+      return () => clearInterval(refreshInterval);
     }
   }, [studentProfile]);
 
@@ -608,6 +819,83 @@ export default function StudentDashboard() {
           </CardContent>
         </Card>
       </div>
+
+      {/* Live Quizzes Section */}
+      <div className="space-y-4">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center space-x-3">
+            <h2 className="text-xl font-semibold text-gray-900">Available Quizzes</h2>
+            <LiveActivityIndicator isActive={!quizzesLoading} />
+          </div>
+          <Button 
+            variant="outline" 
+            size="sm"
+            onClick={() => router.push('/quiz/join')}
+            className="flex items-center space-x-2"
+          >
+            <BookOpen className="w-4 h-4" />
+            <span>Join Quiz</span>
+          </Button>
+        </div>
+        
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+          {quizzesLoading ? (
+            // Loading skeleton
+            Array.from({ length: 3 }).map((_, idx) => (
+              <Card key={idx} className="animate-pulse">
+                <CardContent className="p-4">
+                  <div className="h-4 bg-gray-200 rounded mb-2"></div>
+                  <div className="h-3 bg-gray-200 rounded mb-3"></div>
+                  <div className="flex space-x-2">
+                    <div className="h-6 bg-gray-200 rounded w-16"></div>
+                    <div className="h-6 bg-gray-200 rounded w-20"></div>
+                  </div>
+                </CardContent>
+              </Card>
+            ))
+          ) : availableQuizzes.length > 0 ? (
+            availableQuizzes.slice(0, 6).map((quiz: any) => (
+              <Card key={quiz.id} className="hover:shadow-md transition-shadow border-green-200">
+                <CardContent className="p-4">
+                  <div className="flex items-start justify-between mb-2">
+                    <h3 className="font-medium text-gray-900 truncate flex-1">{quiz.title}</h3>
+                    <Badge variant="secondary" className="ml-2 bg-green-100 text-green-800">
+                      New
+                    </Badge>
+                  </div>
+                  <p className="text-sm text-gray-600 mb-3 truncate">{quiz.subject || 'General'}</p>
+                  <div className="flex items-center justify-between">
+                    <div className="flex space-x-2">
+                      <Badge variant="outline" className="text-xs">
+                        {quiz.timeLimit || 30}min
+                      </Badge>
+                      <Badge variant="outline" className="text-xs">
+                        {quiz.questions?.length || 0}Q
+                      </Badge>
+                    </div>
+                    <Button 
+                      size="sm" 
+                      onClick={() => router.push(`/quiz/take/${quiz.code}`)}
+                      className="bg-green-600 hover:bg-green-700"
+                    >
+                      Take Quiz
+                    </Button>
+                  </div>
+                </CardContent>
+              </Card>
+            ))
+          ) : (
+            <Card className="col-span-full">
+              <CardContent className="p-8 text-center">
+                <BookOpen className="w-12 h-12 text-gray-400 mx-auto mb-4" />
+                <p className="text-gray-600">No quizzes available at the moment</p>
+                <p className="text-sm text-gray-500 mt-1">Check back later or join with a quiz code</p>
+              </CardContent>
+            </Card>
+          )}
+        </div>
+      </div>
+
       {/* About and Tips Section */}
       <div className="mt-10 max-w-4xl mx-auto w-full">
         <Card className="bg-gradient-to-br from-white to-blue-50 shadow-lg border border-blue-100">
@@ -622,7 +910,7 @@ export default function StudentDashboard() {
                 <li>Attend quizzes regularly to improve your rank.</li>
                 <li>Review your quiz history and analytics to identify areas for improvement.</li>
                 <li>Check the leaderboard to see how you compare with your peers.</li>
-                <li>Download your quiz results for revision.</li>
+                <li>Download your quiz results with AI explanations for revision.</li>
               </ul>
                       </div>
             <div className="flex-1 flex flex-col items-center justify-center">
@@ -703,6 +991,13 @@ export default function StudentDashboard() {
                   data={chartData}
                   options={{
                     ...chartOptions,
+                    plugins: {
+                      ...chartOptions.plugins,
+                      legend: {
+                        ...chartOptions.plugins.legend,
+                        position: "top" as const,
+                      },
+                    },
                     maintainAspectRatio: false,
                   }}
                   style={{ width: '100%', height: '100%' }}
@@ -754,15 +1049,34 @@ export default function StudentDashboard() {
               </thead>
               <tbody>
                 {quizHistory.length > 0 ? (
-                  quizHistory.map((quiz: any, idx: number) => (
-                    <tr key={idx} className="border-b hover:bg-gray-50">
-                      <td className="py-3 px-4 font-medium">{quiz.title || quiz.quiz_id}</td>
-                      <td className="py-3 px-4">{quiz.correct_answers}</td>
-                      <td className="py-3 px-4">{Math.round((quiz.correct_answers / quiz.total_questions) * 100)}%</td>
-                      <td className="py-3 px-4">{formatTime(quiz.time_spent)}</td>
-                      <td className="py-3 px-4">{quiz.taken_at ? new Date(quiz.taken_at).toLocaleString() : ''}</td>
-                    </tr>
-                  ))
+                  quizHistory.map((quiz: any, idx: number) => {
+                    // Handle different formats of correct_answers for backwards compatibility
+                    let correctAnswersCount;
+                    if (typeof quiz.correct_answers === 'number') {
+                      correctAnswersCount = quiz.correct_answers;
+                    } else if (typeof quiz.correct_answers === 'object' && quiz.correct_answers !== null) {
+                      // Legacy format: correct_answers was an object mapping question IDs to correct answers
+                      // For display purposes, we can't show this directly - calculate from score instead
+                      correctAnswersCount = quiz.score && quiz.total_questions 
+                        ? Math.round((quiz.score / 100) * quiz.total_questions)
+                        : Object.keys(quiz.correct_answers).length; // Fallback to object size
+                    } else {
+                      // Fallback: calculate from score and total questions
+                      correctAnswersCount = quiz.score && quiz.total_questions 
+                        ? Math.round((quiz.score / 100) * quiz.total_questions)
+                        : 0;
+                    }
+
+                    return (
+                      <tr key={idx} className="border-b hover:bg-gray-50">
+                        <td className="py-3 px-4 font-medium">{quiz.quiz_title || quiz.title || quiz.quiz_id}</td>
+                        <td className="py-3 px-4">{correctAnswersCount}</td>
+                        <td className="py-3 px-4">{quiz.score || Math.round(((correctAnswersCount / (quiz.total_questions || 1)) * 100))}%</td>
+                        <td className="py-3 px-4">{formatTime(quiz.time_spent)}</td>
+                        <td className="py-3 px-4">{quiz.taken_at ? new Date(quiz.taken_at).toLocaleString() : quiz.submitted_at ? new Date(quiz.submitted_at).toLocaleString() : ''}</td>
+                      </tr>
+                    );
+                  })
                 ) : (
                   <tr>
                     <td colSpan={5} className="text-center py-6 text-gray-400">No quizzes taken yet.</td>
@@ -780,78 +1094,130 @@ export default function StudentDashboard() {
   const renderDownloadQuestions = (downloading: string | null, setDownloading: (id: string | null) => void) => {
     console.log('Full quizHistory:', quizHistory);
     const handleDownload = async (quiz: any) => {
+      // Handle different field names - old data might use 'quizcode', new data uses 'quiz_id'
       const quizId = quiz.quiz_id || quiz.id;
-      console.log('Attempting to fetch quiz with id:', quizId, 'from quiz object:', quiz);
-      if (!quizId) {
-        alert('Quiz ID is missing for this quiz history entry. Quiz object: ' + JSON.stringify(quiz));
+      const quizCode = quiz.quiz_code || quiz.quizcode;
+      const identifier = quizId || quizCode;
+      
+      console.log('Attempting to fetch quiz with identifier:', identifier, 'from quiz object:', quiz);
+      if (!identifier) {
+        alert('Quiz ID/Code is missing for this quiz history entry. Quiz object: ' + JSON.stringify(quiz));
         return;
       }
-      setDownloading(quizId);
+      
+      setDownloading(identifier);
       try {
-        // Fetch quiz questions from quizzes table using quiz_id
-        const { data: quizData, error } = await supabase
-          .from('quizzes')
-          .select('questions, title')
-          .eq('id', quizId)
-          .single();
-        console.log('Fetched quizData:', quizData, 'Error:', error);
-        if (error || !quizData || !quizData.questions) {
-          alert('Could not fetch questions for this quiz. Used quizId: ' + quizId + '\nQuiz object: ' + JSON.stringify(quiz) + '\nSupabase error: ' + (error ? JSON.stringify(error) : 'No error object') + '\nQuizData: ' + JSON.stringify(quizData));
+        // Since we now store quiz results in students.quiz_history, we need to check if the quiz data has questions
+        let quizQuestions = null;
+        let quizTitle = quiz.quiz_title || quiz.title || 'Quiz';
+        
+        // Check if quiz history already has the questions stored
+        if (quiz.questions && Array.isArray(quiz.questions)) {
+          quizQuestions = quiz.questions;
+          console.log('Using questions from quiz history:', quizQuestions);
+          // Debug: check if explanations exist in stored questions
+          console.log('Question explanations check:', quizQuestions.map(q => ({ 
+            id: q.id, 
+            hasExplanation: !!q.explanation, 
+            explanation: q.explanation?.substring(0, 100) + '...' 
+          })));
+        } else {
+          // Fallback: try to fetch questions from quizzes table
+          // First try by ID, then by code
+          let quizData = null;
+          let error = null;
+          
+          if (quizId) {
+            console.log('Fetching questions from quizzes table by ID:', quizId);
+            const result = await supabase
+              .from('quizzes')
+              .select('questions, title, id')
+              .eq('id', quizId)
+              .single();
+            quizData = result.data;
+            error = result.error;
+          }
+          
+          // If ID lookup failed and we have a quiz code, try by code
+          if (!quizData && quizCode) {
+            console.log('Fetching questions from quizzes table by code:', quizCode);
+            const result = await supabase
+              .from('quizzes')
+              .select('questions, title, id')
+              .eq('code', quizCode)
+              .single();
+            quizData = result.data;
+            error = result.error;
+          }
+          
+          console.log('Fetched quizData:', quizData, 'Error:', error);
+          if (error || !quizData || !quizData.questions) {
+            // If we can't fetch from quizzes table, create a basic structure from what we have
+            console.log('Could not fetch from quizzes table, creating basic structure from quiz history');
+            quizQuestions = [{
+              id: 1,
+              question: "Quiz data not available - this is a summary based on your results",
+              type: "summary",
+              options: [],
+              correct_answer: "",
+              explanation: `You scored ${quiz.score || 0}% on this quiz with ${quiz.total_questions || 0} questions. Time spent: ${Math.floor((quiz.time_spent || 0) / 60)}m ${(quiz.time_spent || 0) % 60}s`
+            }];
+          } else {
+            quizQuestions = quizData.questions;
+            quizTitle = quizData.title || quizTitle;
+            // Debug: check if explanations exist in fetched questions
+            console.log('Fetched question explanations check:', quizQuestions.map(q => ({ 
+              id: q.id, 
+              hasExplanation: !!q.explanation, 
+              explanationPreview: q.explanation ? q.explanation.substring(0, 100) + '...' : 'No explanation'
+            })));
+          }
+        }
+
+        if (!quizQuestions || quizQuestions.length === 0) {
+          alert('No questions available for this quiz.');
           setDownloading(null);
           return;
         }
-        const questions = quizData.questions;
-        const doc = new jsPDF();
-        doc.setFontSize(16);
-        doc.text(quiz.title || quizData.title || quizId || 'Quiz', 10, 15);
-        doc.setFontSize(12);
-        let y = 30;
-        questions.forEach((q: any, idx: number) => {
-          doc.text(`${idx + 1}. ${q.question}`, 10, y);
-          y += 8;
-          // Get student's answer
-          let studentAnswer = quiz.answers ? quiz.answers[q.id] : undefined;
-          let studentAnswerText = 'N/A';
-          if (q.type === 'multiple-choice' && Array.isArray(q.options) && typeof studentAnswer === 'number') {
-            studentAnswerText = q.options[studentAnswer] ?? 'N/A';
-          } else if (q.type === 'true-false' && Array.isArray(q.options)) {
-            if (typeof studentAnswer === 'string') {
-              studentAnswerText = studentAnswer.charAt(0).toUpperCase() + studentAnswer.slice(1);
-            } else if (typeof studentAnswer === 'number') {
-              studentAnswerText = q.options[studentAnswer] ?? 'N/A';
-            }
-          } else if (typeof studentAnswer === 'string') {
-            studentAnswerText = studentAnswer;
-          }
-          doc.text(`Your answer: ${studentAnswerText}`, 14, y);
-          y += 8;
-          // Handle correct answer for different question types
-          let correctAnswerText = 'N/A';
-          if (q.type === 'multiple-choice' && Array.isArray(q.options) && typeof q.correctAnswer === 'number') {
-            correctAnswerText = q.options[q.correctAnswer] ?? 'N/A';
-          } else if (q.type === 'true-false' && Array.isArray(q.options)) {
-            if (typeof q.correctAnswer === 'string') {
-              correctAnswerText = q.correctAnswer.charAt(0).toUpperCase() + q.correctAnswer.slice(1);
-            } else if (typeof q.correctAnswer === 'number') {
-              correctAnswerText = q.options[q.correctAnswer] ?? 'N/A';
-            }
-          } else if (typeof q.correctAnswer === 'string') {
-            correctAnswerText = q.correctAnswer;
-          }
-          doc.text(`Correct answer: ${correctAnswerText}`, 14, y);
-          y += 8;
-          if (q.description) {
-            doc.text(`Explanation: ${q.description}`, 14, y);
-            y += 10;
-          } else {
-            y += 2;
-          }
-          y += 2;
-          if (y > 270) { doc.addPage(); y = 20; }
+
+        // Final debug check before PDF generation
+        console.log('=== QUIZ EXPLANATION DEBUG ===');
+        console.log('Quiz result data:', quiz);
+        console.log('Questions to be used in PDF:');
+        quizQuestions.forEach((q: any, idx: number) => {
+          console.log(`Question ${idx + 1}:`, {
+            id: q.id,
+            type: q.type,
+            question: q.question?.substring(0, 50) + '...',
+            hasExplanation: !!q.explanation,
+            explanationExists: !!q.explanation && q.explanation.trim().length > 0,
+            explanationLength: q.explanation ? q.explanation.length : 0,
+            explanationPreview: q.explanation ? q.explanation.substring(0, 100) + '...' : 'NO EXPLANATION',
+            allFields: Object.keys(q)
+          });
         });
-        doc.save(`${quiz.title || quizData.title || quizId || 'quiz'}.pdf`);
+        console.log('=== END DEBUG ===');
+
+        // Use the enhanced PDF generator with AI explanations
+        generateStudentQuizDetailedPDF(
+          {
+            title: quizTitle,
+            quiz_id: identifier, // Use the identifier we found
+            score: quiz.score || 0,
+            total_questions: quiz.total_questions || quizQuestions.length,
+            time_spent: quiz.time_spent || 0,
+            submitted_at: quiz.submitted_at || quiz.taken_at || new Date().toISOString()
+          },
+          quizQuestions,
+          quiz.answers || {},
+          {
+            id: user?.id || 'student',
+            name: user?.user_metadata?.full_name || user?.email || 'Student'
+          }
+        );
       } catch (e) {
-        alert('An error occurred while generating the PDF.');
+        console.error('Error generating PDF:', e);
+        alert('An error occurred while generating the PDF: ' + (e as Error).message);
       }
       setDownloading(null);
     };
@@ -859,28 +1225,57 @@ export default function StudentDashboard() {
     return (
     <div className="space-y-6">
       <div>
-          <h1 className="text-2xl font-bold text-gray-900">Download Questions</h1>
-          <p className="text-gray-600">Download your quiz questions and answers as PDF</p>
+          <h1 className="text-2xl font-bold text-gray-900">📥 Download Quiz Analysis</h1>
+          <p className="text-gray-600">Download comprehensive quiz reports with AI-generated explanations, performance insights, and detailed answers</p>
       </div>
         <div className="space-y-4">
           {quizHistory.length === 0 ? (
-            <div className="text-gray-500">No quiz history available.</div>
+            <div className="text-gray-500 p-8 text-center">
+              <div className="text-4xl mb-4">📝</div>
+              <div className="text-lg font-medium">No quiz history available</div>
+              <div className="text-sm">Take some quizzes to see your results here</div>
+            </div>
           ) : (
-            quizHistory.map((quiz: any, idx: number) => (
-              <div key={idx} className="flex items-center justify-between p-4 bg-white rounded shadow">
-                <div className="font-medium">{quiz.title || quiz.quiz_id}</div>
+            quizHistory.map((quiz: any, idx: number) => {
+              const quizIdentifier = quiz.quiz_id || quiz.id || quiz.quiz_code || quiz.quizcode || idx;
+              return (
+              <div key={idx} className="flex items-center justify-between p-4 bg-white rounded-lg shadow-sm border">
+                <div className="flex-1">
+                  <div className="font-medium text-lg">{quiz.quiz_title || quiz.title || `Quiz ${idx + 1}`}</div>
+                  <div className="text-sm text-gray-600 mt-1">
+                    <span className="mr-4">📊 Score: <span className="font-semibold text-blue-600">{quiz.score || 0}%</span></span>
+                    <span className="mr-4">📝 Questions: {quiz.total_questions || 'N/A'}</span>
+                    <span>📅 {quiz.submitted_at ? new Date(quiz.submitted_at).toLocaleDateString() : quiz.taken_at ? new Date(quiz.taken_at).toLocaleDateString() : 'Unknown Date'}</span>
+                  </div>
+                  {quiz.subject && (
+                    <div className="text-xs text-gray-500 mt-1">Subject: {quiz.subject}</div>
+                  )}
+                </div>
                 <button
-                  className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 font-semibold shadow disabled:opacity-60"
+                  className="px-6 py-3 bg-gradient-to-r from-blue-600 to-indigo-600 text-white rounded-lg hover:from-blue-700 hover:to-indigo-700 font-semibold shadow-md transition-all duration-200 disabled:opacity-60 disabled:cursor-not-allowed"
                   onClick={() => handleDownload(quiz)}
-                  disabled={downloading === (quiz.quiz_id || quiz.id)}
+                  disabled={downloading === quizIdentifier}
                 >
-                  {downloading === (quiz.quiz_id || quiz.id) ? 'Downloading...' : 'Download PDF'}
+                  {downloading === quizIdentifier ? (
+                    <span className="flex items-center gap-2">
+                      <svg className="animate-spin h-4 w-4" fill="none" viewBox="0 0 24 24">
+                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                      </svg>
+                      Generating...
+                    </span>
+                  ) : (
+                    <span className="flex items-center gap-2">
+                      📊 Download Report
+                    </span>
+                  )}
                 </button>
-                  </div>
-            ))
+              </div>
+              );
+            })
           )}
-                    </div>
-                  </div>
+        </div>
+    </div>
     );
   };
 
@@ -897,9 +1292,10 @@ export default function StudentDashboard() {
         <h1 className="text-2xl font-bold text-gray-900">Leaderboard</h1>
         <p className="text-gray-600">See how you rank against peers</p>
       </div>
-      <div className="flex items-center gap-2 text-sm text-gray-600">
-        <div className="w-2 h-2 bg-red-500 rounded-full animate-pulse" />
-        Live • Updates every 30 seconds
+      <div className="flex items-center gap-4 text-sm text-gray-600">
+        <LiveActivityIndicator isActive={true} />
+        <span className="hidden sm:inline">Updates in real-time</span>
+        <LastUpdated timestamp={lastUpdateTime} />
       </div>
     </div>
     {/* Leaderboard Scope Selector */}
